@@ -1,0 +1,991 @@
+//@version=6
+indicator("MNQ / MES 5M SMT", overlay=true, max_lines_count=500, dynamic_requests=true)
+// Native 5-minute MNQ/MES data is requested once per symbol. Chart symbol
+// detection is deliberately kept outside the request expressions so it cannot
+// accidentally resolve to MNQ while evaluating a requested MNQ context.
+//====================================================
+// Settings
+//====================================================
+string GROUP_SYMBOLS = "Symbols"
+string mnqSymbol = input.symbol("CME_MINI:MNQ1!", "MNQ symbol", group=GROUP_SYMBOLS)
+string mesSymbol = input.symbol("CME_MINI:MES1!", "MES symbol", group=GROUP_SYMBOLS)
+int SOURCE_SECONDS = 300
+int SOURCE_MS = SOURCE_SECONDS * 1000
+int REFERENCE_CAPACITY = 32
+string GROUP_DETECTION = "5M SMT Detection"
+int drawingPivotStrength = input.int(2, "SMT Drawing Pivot", minval=1, maxval=10, group=GROUP_DETECTION)
+int alertPivotStrength = input.int(0, "Alert Pivot", minval=0, maxval=10, group=GROUP_DETECTION,
+     tooltip="Retained for settings compatibility. Alerts now use the validated Drawing Pivot event so each drawn SMT and its alert share the same pivot pair.")
+int swingToleranceBars = input.int(1, "Swing matching tolerance (5M bars)", minval=0, maxval=5, group=GROUP_DETECTION)
+int maxSwingDistanceBars = input.int(100, "Maximum distance from matched swing (5M bars)", minval=1, maxval=1000, group=GROUP_DETECTION)
+int pivotQueueCapacity = math.min(32, swingToleranceBars + drawingPivotStrength + 2)
+int alertPivotQueueCapacity = math.min(32, swingToleranceBars + alertPivotStrength + 2)
+float minimumStrength = input.float(70.0, "Minimum SMT strength (%)", minval=0.0, maxval=100.0, step=1.0, group=GROUP_DETECTION)
+int minimumDivergenceTicks = input.int(2, "Minimum divergence distance (sweeper ticks)", minval=0, maxval=10000, group=GROUP_DETECTION)
+bool useMinimumPercentDifference = input.bool(false, "Use minimum percentage difference", group=GROUP_DETECTION)
+float minimumPercentDifference = input.float(0.10, "Minimum percentage difference (%)", minval=0.0, maxval=10.0, step=0.01, group=GROUP_DETECTION)
+string GROUP_ALERTS = "Alerts"
+bool enableAlerts = input.bool(true, "Enable SMT alerts", group=GROUP_ALERTS,
+     tooltip="Alerts use confirmed 5M source bars on supported time-based chart timeframes. Drawings are shown only on charts at or below 5 minutes.")
+bool enableBullishAlerts = input.bool(true, "Enable bullish alerts", group=GROUP_ALERTS)
+bool enableBearishAlerts = input.bool(true, "Enable bearish alerts", group=GROUP_ALERTS)
+int candleClosesBeforeAlert = input.int(0, "Additional 5M candles before alert", minval=0, maxval=10, group=GROUP_ALERTS,
+     tooltip="0 alerts at the close of the 5M candle that confirms the SMT. 1 alerts at the close of the next 5M candle, 2 at the close of the second following 5M candle, and so on.")
+int pendingAlertCapacity = (candleClosesBeforeAlert + 1) * 2
+string GROUP_DRAWINGS = "Drawings"
+bool showHistoricalLines = input.bool(true, "Show historical SMT lines", group=GROUP_DRAWINGS)
+bool showBullishLines = input.bool(true, "Show bullish SMT lines", group=GROUP_DRAWINGS)
+bool showBearishLines = input.bool(true, "Show bearish SMT lines", group=GROUP_DRAWINGS)
+bool showOnlyLatest = input.bool(false, "Show only the latest SMT", group=GROUP_DRAWINGS)
+int maximumHistoricalSignals = input.int(10, "Maximum Historical SMT Signals",
+     options=[10, 20, 30, 50, 100], group=GROUP_DRAWINGS,
+     tooltip="Combined bullish and bearish history. This also selects the 5M source lookback: 900 / 1800 / 2600 / 4200 / 8000 candles for 10 / 20 / 30 / 50 / 100 signals.")
+color bullishColor = input.color(color.green, "Bullish color", group=GROUP_DRAWINGS)
+color bearishColor = input.color(color.red, "Bearish color", group=GROUP_DRAWINGS)
+int lineWidth = input.int(1, "Line width", minval=1, maxval=5, group=GROUP_DRAWINGS)
+int lineTransparency = input.int(70, "Line transparency", minval=0, maxval=100, group=GROUP_DRAWINGS)
+string GROUP_DEBUG = "Debug"
+bool debugMode = input.bool(false, "Enable debug mode", group=GROUP_DEBUG)
+int chartSeconds = timeframe.in_seconds()
+string chartRoot = str.upper(syminfo.root)
+string chartTicker = str.upper(syminfo.ticker)
+bool chartIsMNQ = str.contains(chartRoot, "NQ") or str.contains(chartTicker, "MNQ") or str.contains(chartTicker, "NQ1!")
+bool chartIsMES = str.contains(chartRoot, "ES") or str.contains(chartTicker, "MES") or str.contains(chartTicker, "ES1!")
+bool supportedChart = (chartIsMNQ or chartIsMES) and not (chartIsMNQ and chartIsMES)
+bool drawingsVisible = not na(chartSeconds) and chartSeconds <= SOURCE_SECONDS
+bool needBullishEngine = debugMode or (enableAlerts and enableBullishAlerts) or
+     (drawingsVisible and showHistoricalLines and showBullishLines)
+bool needBearishEngine = debugMode or (enableAlerts and enableBearishAlerts) or
+     (drawingsVisible and showHistoricalLines and showBearishLines)
+// Higher chart timeframes consume confirmed 5M intrabars.
+// Drawings remain limited to charts at or below 5 minutes.
+bool canRunEngine = supportedChart and (needBullishEngine or needBearishEngine)
+bool drawUsingMNQPrices = chartIsMNQ
+if barstate.isfirst and not supportedChart
+    runtime.error("Use this indicator on an MNQ/NQ or MES/ES chart.")
+if barstate.isfirst and na(chartSeconds)
+    runtime.error("Use this indicator on a time-based chart.")
+//====================================================
+// Trend-bias (24t) for webhook/Telegram-filter
+//====================================================
+string GROUP_BIAS = "Trend bias (24h)"
+float biasThresholdPct = input.float(1.0, "Trend threshold 24h (%)", minval=0.0, maxval=10.0, step=0.1, group=GROUP_BIAS,
+     tooltip="Change over ~24h on MNQ (hourly bars). Above +threshold = UP, below -threshold = DOWN, otherwise NONE.")
+bool sendCounterTrend = input.bool(true, "Also alert counter-trend SMT (sent as INFO)", group=GROUP_BIAS,
+     tooltip="Off = bearish SMT in an UP trend and bullish SMT in a DOWN trend (and all SMT with no trend) are not alerted at all.")
+[biasNowPrice, biasRefPrice] = request.security(mnqSymbol, "60", [close, close[24]], lookahead=barmerge.lookahead_off)
+float bias24Pct = not na(biasRefPrice) and biasRefPrice != 0 ? 100.0 * (biasNowPrice - biasRefPrice) / biasRefPrice : na
+string bias24State = na(bias24Pct) ? "NONE" : bias24Pct >= biasThresholdPct ? "UP" : bias24Pct <= -biasThresholdPct ? "DOWN" : "NONE"
+f_biasText() =>
+    string pctText = na(bias24Pct) ? "n/a" : (bias24Pct >= 0 ? "+" : "") + str.tostring(bias24Pct, "#.##") + "%"
+    " | 24t: " + pctText + " | bias=" + bias24State
+varip int realtimeStart = na
+if barstate.isrealtime and na(realtimeStart)
+    realtimeStart := timenow
+//====================================================
+// Types and source helpers
+//====================================================
+type PivotPoint
+    int pivotTime
+    float price
+type SourceBundle
+    float highValue
+    float lowValue
+    float closeValue
+    int sourceTime
+    int sourceClose
+    float tickSize
+    float pivotHigh
+    int pivotHighTime
+    float pivotLow
+    int pivotLowTime
+    float alertPivotHigh
+    int alertPivotHighTime
+    float alertPivotLow
+    int alertPivotLowTime
+    float atrValue
+    // Previous closed 5M candle ([1]) for catch-up of a missed closing execution.
+    float prevHighValue
+    float prevLowValue
+    float prevCloseValue
+    int prevSourceTime
+    int prevSourceClose
+    float prevPivotHigh
+    int prevPivotHighTime
+    float prevPivotLow
+    int prevPivotLowTime
+    float prevAtrValue
+type PendingSmt
+    string eventId
+    bool bullish
+    string sourceTimeframe
+    int confirmationBarTime
+    float confirmationClose
+    int completedCandlesSinceConfirmation
+    bool alertSent
+type SourceCandle
+    int sourceTime
+    int sourceClose
+    float highValue
+    float lowValue
+type DrawSmt
+    bool bullish
+    int eventId
+    int x1
+    float y1
+    int x2
+    float y2
+type SweepReference
+    int mnqTime
+    float mnqPrice
+    int mesTime
+    float mesPrice
+    int activationClose
+    bool mnqTaken = false
+    bool mesTaken = false
+    bool divergedNow = false
+// This runs inside the explicit symbol/"5" request. No chart timeframe data
+// and no 1-minute data enter the pivot calculation. The host only consumes a
+// source candle after its close timestamp has passed.
+f_sourceBundle(int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
+    float swingHigh = na
+    float swingLow = na
+    float alertSwingHigh = na
+    float alertSwingLow = na
+    int alertLeftBars = math.max(1, alertStrength)
+    if includeHighPivots
+        swingHigh := ta.pivothigh(high, drawingStrength, drawingStrength)
+        alertSwingHigh := ta.pivothigh(high, alertLeftBars, alertStrength)
+    if includeLowPivots
+        swingLow := ta.pivotlow(low, drawingStrength, drawingStrength)
+        alertSwingLow := ta.pivotlow(low, alertLeftBars, alertStrength)
+    int swingHighTime = not na(swingHigh) ? time[drawingStrength] : na
+    int swingLowTime = not na(swingLow) ? time[drawingStrength] : na
+    int alertSwingHighTime = not na(alertSwingHigh) ? time[alertStrength] : na
+    int alertSwingLowTime = not na(alertSwingLow) ? time[alertStrength] : na
+    float bundleHigh = includeHighPivots ? high : na
+    float bundleLow = includeLowPivots ? low : na
+    float atrValue = ta.atr(14)
+    SourceBundle.new(bundleHigh, bundleLow,
+         close, time, time_close, syminfo.mintick,
+         swingHigh, swingHighTime, swingLow, swingLowTime, alertSwingHigh, alertSwingHighTime, alertSwingLow, alertSwingLowTime, atrValue,
+         bundleHigh[1], bundleLow[1], close[1], time[1], time_close[1],
+         swingHigh[1], swingHighTime[1], swingLow[1], swingLowTime[1], atrValue[1])
+// calc_bars_count is a compile-time constant in Pine. These small wrappers let
+// the user-selected signal cap choose a matching, bounded 5M history window.
+f_request900(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
+    request.security(tickerId, "5", f_sourceBundle(drawingStrength, alertStrength, includeHighPivots, includeLowPivots), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, calc_bars_count=900)
+f_request1800(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
+    request.security(tickerId, "5", f_sourceBundle(drawingStrength, alertStrength, includeHighPivots, includeLowPivots), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, calc_bars_count=1800)
+f_request2600(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
+    request.security(tickerId, "5", f_sourceBundle(drawingStrength, alertStrength, includeHighPivots, includeLowPivots), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, calc_bars_count=2600)
+f_request4200(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
+    request.security(tickerId, "5", f_sourceBundle(drawingStrength, alertStrength, includeHighPivots, includeLowPivots), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, calc_bars_count=4200)
+f_request8000(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
+    request.security(tickerId, "5", f_sourceBundle(drawingStrength, alertStrength, includeHighPivots, includeLowPivots), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, calc_bars_count=8000)
+f_requestLower900(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
+    request.security_lower_tf(tickerId, "5", f_sourceBundle(drawingStrength, alertStrength, includeHighPivots, includeLowPivots), ignore_invalid_timeframe=false, calc_bars_count=900)
+f_requestLower1800(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
+    request.security_lower_tf(tickerId, "5", f_sourceBundle(drawingStrength, alertStrength, includeHighPivots, includeLowPivots), ignore_invalid_timeframe=false, calc_bars_count=1800)
+f_requestLower2600(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
+    request.security_lower_tf(tickerId, "5", f_sourceBundle(drawingStrength, alertStrength, includeHighPivots, includeLowPivots), ignore_invalid_timeframe=false, calc_bars_count=2600)
+f_requestLower4200(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
+    request.security_lower_tf(tickerId, "5", f_sourceBundle(drawingStrength, alertStrength, includeHighPivots, includeLowPivots), ignore_invalid_timeframe=false, calc_bars_count=4200)
+f_requestLower8000(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
+    request.security_lower_tf(tickerId, "5", f_sourceBundle(drawingStrength, alertStrength, includeHighPivots, includeLowPivots), ignore_invalid_timeframe=false, calc_bars_count=8000)
+f_pushPivot(array<PivotPoint> queue, float price, int pivotTime, int capacity) =>
+    if not na(price) and not na(pivotTime)
+        array.push(queue, PivotPoint.new(pivotTime, price))
+        while array.size(queue) > capacity
+            array.shift(queue)
+    true
+f_pushSourceCandle(array<SourceCandle> candles, SourceCandle candle, int capacity) =>
+    array.push(candles, candle)
+    while array.size(candles) > capacity
+        array.shift(candles)
+    true
+// Reject the SMT if the straight line between the confirmed wick pivots
+// intersects any intervening source candle range on this instrument.
+f_segmentClear(array<SourceCandle> candles, int startTime, float startPrice,
+     int endTime, float endPrice, bool highSegment) =>
+    bool clear = not na(startTime) and not na(endTime) and not na(startPrice) and
+         not na(endPrice) and endTime > startTime and array.size(candles) > 0
+    int count = array.size(candles)
+    if clear
+        SourceCandle oldest = array.get(candles, 0)
+        SourceCandle newest = array.get(candles, count - 1)
+        if oldest.sourceTime > startTime or newest.sourceTime < endTime
+            clear := false
+    bool startEndpointFound = false
+    bool endEndpointFound = false
+    int index = 0
+    while clear and index < count
+        SourceCandle candle = array.get(candles, index)
+        if candle.sourceTime > endTime
+            index := count
+        else
+            if candle.sourceTime == startTime
+                startEndpointFound := highSegment ? candle.highValue == startPrice : candle.lowValue == startPrice
+            if candle.sourceTime == endTime
+                endEndpointFound := highSegment ? candle.highValue == endPrice : candle.lowValue == endPrice
+            if candle.sourceTime > startTime and candle.sourceTime < endTime
+                if candle.sourceClose > endTime
+                    clear := false
+                else
+                    float fractionOpen = float(candle.sourceTime - startTime) / float(endTime - startTime)
+                    float fractionClose = float(candle.sourceClose - startTime) / float(endTime - startTime)
+                    float lineAtOpen = startPrice + (endPrice - startPrice) * fractionOpen
+                    float lineAtClose = startPrice + (endPrice - startPrice) * fractionClose
+                    float segmentFloor = math.min(lineAtOpen, lineAtClose)
+                    float segmentCeiling = math.max(lineAtOpen, lineAtClose)
+                    if highSegment and candle.highValue >= segmentFloor
+                        clear := false
+                    if not highSegment and candle.lowValue <= segmentCeiling
+                        clear := false
+        index += 1
+    clear and startEndpointFound and endEndpointFound
+f_debugTime(int sourceTime) =>
+    na(sourceTime) ? "na" : str.format_time(sourceTime, "MM-dd HH:mm", "America/New_York")
+// FIFO, one-to-one time matching. The queues are bounded to 32 pivots and this
+// function runs only once for a newly closed, synchronized 5M candle.
+f_takeMatchedPivot(array<PivotPoint> mnqQueue, array<PivotPoint> mesQueue,
+     int toleranceMs, int nowTime, int maxQueueAgeMs) =>
+    bool matched = false
+    int mnqTime = na
+    float mnqPrice = na
+    int mesTime = na
+    float mesPrice = na
+    int comparedMNQTime = na
+    int comparedMESTime = na
+    bool searching = true
+    while searching
+        int mnqCount = array.size(mnqQueue)
+        int mesCount = array.size(mesQueue)
+        if mnqCount > 0 and mesCount > 0
+            PivotPoint mnqPivot = array.get(mnqQueue, 0)
+            PivotPoint mesPivot = array.get(mesQueue, 0)
+            comparedMNQTime := mnqPivot.pivotTime
+            comparedMESTime := mesPivot.pivotTime
+            if math.abs(mnqPivot.pivotTime - mesPivot.pivotTime) <= toleranceMs
+                mnqPivot := array.shift(mnqQueue)
+                mesPivot := array.shift(mesQueue)
+                mnqTime := mnqPivot.pivotTime
+                mnqPrice := mnqPivot.price
+                mesTime := mesPivot.pivotTime
+                mesPrice := mesPivot.price
+                matched := true
+                searching := false
+            else if mnqPivot.pivotTime < mesPivot.pivotTime
+                array.shift(mnqQueue)
+            else
+                array.shift(mesQueue)
+        else
+            bool removedOld = false
+            if mnqCount > 0
+                PivotPoint oldestMNQ = array.get(mnqQueue, 0)
+                if not na(nowTime) and nowTime > oldestMNQ.pivotTime + maxQueueAgeMs
+                    array.shift(mnqQueue)
+                    removedOld := true
+            if mesCount > 0
+                PivotPoint oldestMES = array.get(mesQueue, 0)
+                if not na(nowTime) and nowTime > oldestMES.pivotTime + maxQueueAgeMs
+                    array.shift(mesQueue)
+                    removedOld := true
+            if not removedOld
+                searching := false
+    [matched, mnqTime, mnqPrice, mesTime, mesPrice, comparedMNQTime, comparedMESTime]
+// Builds the previous closed 5M candle from the [1] fields of a requested bundle.
+// It lets the host catch up a closed source candle whose closing execution was
+// missed. lastSourceClose still guarantees each candle is processed only once.
+f_previousBundle(SourceBundle source) =>
+    SourceBundle previous = na
+    if not na(source)
+        if not na(source.prevSourceTime) and not na(source.prevSourceClose)
+            previous := SourceBundle.new(source.prevHighValue, source.prevLowValue, source.prevCloseValue,
+                 source.prevSourceTime, source.prevSourceClose, source.tickSize,
+                 source.prevPivotHigh, source.prevPivotHighTime, source.prevPivotLow, source.prevPivotLowTime,
+                 na, na, na, na, source.prevAtrValue)
+    previous
+// Most extreme high (highSide) or low after afterTime, earliest candle on ties.
+f_extremeAfter(array<SourceCandle> candles, int afterTime, bool highSide) =>
+    int bestTime = na
+    float bestPrice = na
+    int index = 0
+    while index < array.size(candles)
+        SourceCandle candle = array.get(candles, index)
+        if candle.sourceTime > afterTime
+            float price = highSide ? candle.highValue : candle.lowValue
+            if not na(price) and (na(bestPrice) or (highSide ? price > bestPrice : price < bestPrice))
+                bestPrice := price
+                bestTime := candle.sourceTime
+        index += 1
+    [bestTime, bestPrice]
+// High or low of the stored source candle that opened at atTime.
+f_candlePrice(array<SourceCandle> candles, int atTime, bool highSide) =>
+    float price = na
+    int index = array.size(candles) - 1
+    while index >= 0
+        SourceCandle candle = array.get(candles, index)
+        if candle.sourceTime == atTime
+            price := highSide ? candle.highValue : candle.lowValue
+            index := -1
+        else if candle.sourceTime < atTime
+            index := -1
+        else
+            index -= 1
+    price
+// Registers a matched, confirmed pivot pair as an active sweep reference.
+// Taken flags include every closed candle after each market's own pivot up to
+// and including the activation candle, so a sweep that happened before the
+// pair could be confirmed is evaluated on the activation candle.
+f_registerReference(array<SweepReference> refs, array<SourceCandle> mnqCandles, array<SourceCandle> mesCandles,
+     bool highSide, int mnqPivotTime, float mnqPivotPrice, int mesPivotTime, float mesPivotPrice,
+     int activationClose, int capacity) =>
+    [mnqExtTime, mnqExtPrice] = f_extremeAfter(mnqCandles, mnqPivotTime, highSide)
+    [mesExtTime, mesExtPrice] = f_extremeAfter(mesCandles, mesPivotTime, highSide)
+    bool mnqTaken = not na(mnqExtPrice) and (highSide ? mnqExtPrice > mnqPivotPrice : mnqExtPrice < mnqPivotPrice)
+    bool mesTaken = not na(mesExtPrice) and (highSide ? mesExtPrice > mesPivotPrice : mesExtPrice < mesPivotPrice)
+    bool registered = false
+    if not na(mnqPivotTime) and not na(mesPivotTime) and not na(mnqPivotPrice) and not na(mesPivotPrice) and not (mnqTaken and mesTaken)
+        array.push(refs, SweepReference.new(mnqPivotTime, mnqPivotPrice, mesPivotTime, mesPivotPrice,
+             activationClose, mnqTaken, mesTaken, false))
+        registered := true
+        while array.size(refs) > capacity
+            array.shift(refs)
+    registered
+// Evaluates every active reference of one direction against one closed,
+// synchronized 5M candle. Returns at most one validated SMT event. When an event
+// is confirmed, every reference that diverged on this candle is consumed so the
+// same move cannot create duplicate lines or alerts. References that diverged
+// but failed a filter stay active and can confirm on a later candle.
+f_evaluateSweeps(array<SweepReference> refs, array<SourceCandle> mnqCandles, array<SourceCandle> mesCandles,
+     bool highSide, int candleTime, int candleClose,
+     float mnqExtreme, float mesExtreme, float mnqATR, float mesATR, float mnqTick, float mesTick,
+     int maxReferenceAgeMs) =>
+    bool found = false
+    float bestRank = na
+    int bestRefMNQTime = na
+    float bestRefMNQPrice = na
+    int bestRefMESTime = na
+    float bestRefMESPrice = na
+    int bestSweepTime = na
+    float bestEndMNQPrice = na
+    float bestEndMESPrice = na
+    bool bestMNQSwept = false
+    int divergedCount = 0
+    string reason = "no active reference swept"
+    int index = 0
+    while index < array.size(refs)
+        SweepReference activeRef = array.get(refs, index)
+        activeRef.divergedNow := false
+        bool removeRef = false
+        if na(candleTime) or candleTime - math.max(activeRef.mnqTime, activeRef.mesTime) > maxReferenceAgeMs
+            removeRef := true
+        else
+            bool candidate = false
+            bool mnqSweeper = false
+            int sweepTime = na
+            if activeRef.activationClose == candleClose
+                // Activation candle: taken flags were computed at registration and
+                // already include this candle.
+                if activeRef.mnqTaken and activeRef.mesTaken
+                    removeRef := true
+                else if activeRef.mnqTaken or activeRef.mesTaken
+                    mnqSweeper := activeRef.mnqTaken
+                    [extTime, extPrice] = f_extremeAfter(mnqSweeper ? mnqCandles : mesCandles,
+                         mnqSweeper ? activeRef.mnqTime : activeRef.mesTime, highSide)
+                    sweepTime := extTime
+                    candidate := not na(extTime)
+            else
+                bool mnqNow = not na(mnqExtreme) and (highSide ? mnqExtreme > activeRef.mnqPrice : mnqExtreme < activeRef.mnqPrice)
+                bool mesNow = not na(mesExtreme) and (highSide ? mesExtreme > activeRef.mesPrice : mesExtreme < activeRef.mesPrice)
+                activeRef.mnqTaken := activeRef.mnqTaken or mnqNow
+                activeRef.mesTaken := activeRef.mesTaken or mesNow
+                if activeRef.mnqTaken and activeRef.mesTaken
+                    // Both markets have taken the level: no divergence is possible.
+                    removeRef := true
+                else if mnqNow or mesNow
+                    mnqSweeper := mnqNow
+                    sweepTime := candleTime
+                    candidate := true
+            if candidate
+                activeRef.divergedNow := true
+                divergedCount += 1
+                float mnqEnd = f_candlePrice(mnqCandles, sweepTime, highSide)
+                float mesEnd = f_candlePrice(mesCandles, sweepTime, highSide)
+                bool endpointsKnown = not na(mnqEnd) and not na(mesEnd)
+                float sweepRef = mnqSweeper ? activeRef.mnqPrice : activeRef.mesPrice
+                float sweepEnd = mnqSweeper ? mnqEnd : mesEnd
+                float heldRef = mnqSweeper ? activeRef.mesPrice : activeRef.mnqPrice
+                float heldEnd = mnqSweeper ? mesEnd : mnqEnd
+                float sweepDistance = highSide ? sweepEnd - sweepRef : sweepRef - sweepEnd
+                float heldDistance = highSide ? heldRef - heldEnd : heldEnd - heldRef
+                bool segmentClear = endpointsKnown and
+                     f_segmentClear(mnqCandles, activeRef.mnqTime, activeRef.mnqPrice, sweepTime, mnqEnd, highSide) and
+                     f_segmentClear(mesCandles, activeRef.mesTime, activeRef.mesPrice, sweepTime, mesEnd, highSide)
+                float sweepATR = mnqSweeper ? mnqATR : mesATR
+                float heldATR = mnqSweeper ? mesATR : mnqATR
+                float sweepTick = mnqSweeper ? mnqTick : mesTick
+                float strengthPct = endpointsKnown and not na(sweepATR) and sweepATR > 0 and not na(heldATR) and heldATR > 0 ?
+                     math.min(100.0, 50.0 * (sweepDistance / sweepATR + heldDistance / heldATR)) : na
+                bool tickPass = endpointsKnown and not na(sweepTick) and sweepTick > 0 and sweepDistance / sweepTick >= minimumDivergenceTicks
+                bool percentPass = endpointsKnown
+                if endpointsKnown and useMinimumPercentDifference
+                    float mnqMovePct = highSide ? 100.0 * (mnqEnd - activeRef.mnqPrice) / activeRef.mnqPrice : 100.0 * (activeRef.mnqPrice - mnqEnd) / activeRef.mnqPrice
+                    float mesMovePct = highSide ? 100.0 * (mesEnd - activeRef.mesPrice) / activeRef.mesPrice : 100.0 * (activeRef.mesPrice - mesEnd) / activeRef.mesPrice
+                    percentPass := math.abs(mnqMovePct - mesMovePct) >= minimumPercentDifference
+                bool strengthPass = not na(strengthPct) and strengthPct >= minimumStrength
+                if segmentClear and tickPass and percentPass and strengthPass
+                    // Most extreme reference wins: highest high / lowest low.
+                    float rank = activeRef.mnqPrice
+                    if not found or (highSide ? rank > bestRank : rank < bestRank)
+                        found := true
+                        bestRank := rank
+                        bestRefMNQTime := activeRef.mnqTime
+                        bestRefMNQPrice := activeRef.mnqPrice
+                        bestRefMESTime := activeRef.mesTime
+                        bestRefMESPrice := activeRef.mesPrice
+                        bestSweepTime := sweepTime
+                        bestEndMNQPrice := mnqEnd
+                        bestEndMESPrice := mesEnd
+                        bestMNQSwept := mnqSweeper
+                else if not found
+                    reason := not endpointsKnown ? "source candle history incomplete" :
+                         not segmentClear ? "segment crosses an intermediate 5M candle on MNQ or MES" :
+                         not tickPass ? "divergence ticks below minimum" :
+                         not percentPass ? "percent filter" : "strength below minimum"
+        if removeRef
+            array.remove(refs, index)
+        else
+            index += 1
+    if found
+        int removeIndex = array.size(refs) - 1
+        while removeIndex >= 0
+            SweepReference consumed = array.get(refs, removeIndex)
+            if consumed.divergedNow
+                array.remove(refs, removeIndex)
+            removeIndex -= 1
+        reason := "confirmed"
+    [found, bestRefMNQTime, bestRefMNQPrice, bestRefMESTime, bestRefMESPrice, bestSweepTime,
+         bestEndMNQPrice, bestEndMESPrice, bestMNQSwept, divergedCount, reason]
+f_sendAlert(array<string> keys, bool active, bool allowed, string eventKey,
+     int eventSourceClose, int firedAt, string message) =>
+    bool sent = false
+    if active and allowed and not array.includes(keys, eventKey) and barstate.isrealtime and not na(realtimeStart) and
+         not na(eventSourceClose) and not na(firedAt) and eventSourceClose > realtimeStart and
+         firedAt > realtimeStart
+        alert(message, alert.freq_all)
+        array.push(keys, eventKey)
+        sent := true
+        while array.size(keys) > 256
+            array.shift(keys)
+    sent
+// Called exactly once per closed, synchronized 5M source candle. The candle that
+// confirms the SMT leaves the counter at 0; every later closed 5M candle adds 1.
+// Delay 0 = close of the confirming candle, 1 = close of the next 5M candle, etc.
+// An event is removed from the queue only when it is due.
+f_processPendingAlerts(array<PendingSmt> queue, array<string> sentKeys,
+     int sourceCloseTime, int requiredCandles,
+     bool alertsEnabled, bool bullishEnabled, bool bearishEnabled) =>
+    int index = 0
+    while index < array.size(queue)
+        PendingSmt pending = array.get(queue, index)
+        if sourceCloseTime > pending.confirmationBarTime
+            pending.completedCandlesSinceConfirmation := pending.completedCandlesSinceConfirmation + 1
+        bool directionEnabled = pending.bullish ? bullishEnabled : bearishEnabled
+        if pending.sourceTimeframe == "5" and pending.completedCandlesSinceConfirmation >= requiredCandles
+            bool trendAligned = pending.bullish ? bias24State == "UP" : bias24State == "DOWN"
+            if not pending.alertSent and alertsEnabled and directionEnabled and (trendAligned or sendCounterTrend)
+                string message = (pending.bullish ? "🚨🟢 BULLISH 5M SMT – MNQ / MES – " : "🚨🔴 BEARISH 5M SMT – MNQ / MES – ") +
+                     str.tostring(pending.confirmationClose, format.mintick) + f_biasText()
+                bool sent = f_sendAlert(sentKeys, true, alertsEnabled and directionEnabled,
+                     pending.eventId, pending.confirmationBarTime, sourceCloseTime, message)
+                pending.alertSent := sent
+            array.remove(queue, index)
+        else
+            index += 1
+    true
+f_recordDraw(array<DrawSmt> historyQueue, array<DrawSmt> realtimeQueue,
+     DrawSmt drawing, int limit, bool latestOnly, bool isHistorical) =>
+    if isHistorical
+        if latestOnly
+            array.clear(historyQueue)
+        array.push(historyQueue, drawing)
+        while array.size(historyQueue) > limit
+            array.shift(historyQueue)
+    else
+        array.push(realtimeQueue, drawing)
+        while array.size(realtimeQueue) > limit
+            array.shift(realtimeQueue)
+    true
+f_renderDraw(DrawSmt drawing, array<line> lines, array<string> keys,
+     int limit, bool latestOnly, bool showLines, color bullColor, color bearColor,
+     int transparency, int width) =>
+    string key = (drawing.bullish ? "B:" : "S:") + str.tostring(drawing.eventId)
+    if showLines and not array.includes(keys, key) and drawing.x2 > drawing.x1
+        if latestOnly
+            while array.size(lines) > 0
+                line.delete(array.shift(lines))
+        color baseColor = drawing.bullish ? bullColor : bearColor
+        line id = line.new(x1=drawing.x1, y1=drawing.y1, x2=drawing.x2, y2=drawing.y2,
+             xloc=xloc.bar_time, extend=extend.none, color=color.new(baseColor, transparency), width=width)
+        array.push(lines, id)
+        array.push(keys, key)
+        while array.size(lines) > limit
+            line.delete(array.shift(lines))
+        while array.size(keys) > limit
+            array.shift(keys)
+    true
+//====================================================
+// Persistent 5M-only state
+//====================================================
+varip int lastSourceClose = na
+varip int lastMNQHighPivotTime = na
+varip int lastMESHighPivotTime = na
+varip int lastMNQLowPivotTime = na
+varip int lastMESLowPivotTime = na
+varip array<PivotPoint> mnqHighQueue = array.new<PivotPoint>()
+varip array<PivotPoint> mesHighQueue = array.new<PivotPoint>()
+varip array<PivotPoint> mnqLowQueue = array.new<PivotPoint>()
+varip array<PivotPoint> mesLowQueue = array.new<PivotPoint>()
+// Alert pivots have independent queues and swing references. Changing their
+// strength cannot alter the drawing engine's matched pivots or line geometry.
+varip int lastAlertMNQHighPivotTime = na
+varip int lastAlertMESHighPivotTime = na
+varip int lastAlertMNQLowPivotTime = na
+varip int lastAlertMESLowPivotTime = na
+varip array<PivotPoint> alertMNQHighQueue = array.new<PivotPoint>()
+varip array<PivotPoint> alertMESHighQueue = array.new<PivotPoint>()
+varip array<PivotPoint> alertMNQLowQueue = array.new<PivotPoint>()
+varip array<PivotPoint> alertMESLowQueue = array.new<PivotPoint>()
+varip int alertReferenceMNQHighTime = na
+varip float alertReferenceMNQHigh = na
+varip int alertReferenceMESHighTime = na
+varip float alertReferenceMESHigh = na
+varip int alertReferenceMNQLowTime = na
+varip float alertReferenceMNQLow = na
+varip int alertReferenceMESLowTime = na
+varip float alertReferenceMESLow = na
+varip array<string> alertProcessedKeys = array.new_string()
+varip array<SourceCandle> mnqSourceCandles = array.new<SourceCandle>()
+varip array<SourceCandle> mesSourceCandles = array.new<SourceCandle>()
+// Keep alert-segment history independent so Alert Pivot cannot change the
+// drawing engine's candle arrays or retention window.
+varip array<SourceCandle> alertMNQSourceCandles = array.new<SourceCandle>()
+varip array<SourceCandle> alertMESSourceCandles = array.new<SourceCandle>()
+// A source bar can confirm one high and one low event. Keep enough entries for
+// both directions across the maximum configured 20 source-candle delay.
+varip array<PendingSmt> pendingAlerts = array.new<PendingSmt>()
+varip array<DrawSmt> pendingDraws = array.new<DrawSmt>()
+var array<DrawSmt> historicalDraws = array.new<DrawSmt>()
+// Active sweep references: matched, confirmed pivot pairs that have not been
+// taken by both markets and have not yet produced an SMT event.
+varip array<SweepReference> activeHighReferences = array.new<SweepReference>()
+varip array<SweepReference> activeLowReferences = array.new<SweepReference>()
+varip array<string> alertedKeys = array.new_string()
+varip array<string> processedEventKeys = array.new_string()
+var array<string> drawnKeys = array.new_string()
+var array<line> smtLines = array.new<line>()
+varip int mnqPivotCount = 0
+varip int mesPivotCount = 0
+varip int matchedHighCount = 0
+varip int matchedLowCount = 0
+varip int bullishSignalCount = 0
+varip int bearishSignalCount = 0
+varip int lastDebugSourceClose = na
+varip string debugHighPair = "waiting for confirmed pivots"
+varip string debugHighSync = "not evaluated"
+varip string debugLowPair = "waiting for confirmed pivots"
+varip string debugLowSync = "not evaluated"
+varip string debugSignalStatus = "no confirmed pair evaluated"
+varip string debugAlertStatus = "no alert event"
+varip string debugAlertReason = "no alert triggered"
+//====================================================
+// Two 5M source requests per execution. The selected request budget bounds the
+// historical window; all stateful work is gated to a new closed source bar.
+//====================================================
+if canRunEngine
+    array<SourceBundle> mnqBars = array.new<SourceBundle>()
+    array<SourceBundle> mesBars = array.new<SourceBundle>()
+    if chartSeconds <= SOURCE_SECONDS
+        SourceBundle mnqSingle = na
+        SourceBundle mesSingle = na
+        if maximumHistoricalSignals == 10
+            mnqSingle := f_request900(mnqSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+            mesSingle := f_request900(mesSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+        else if maximumHistoricalSignals == 20
+            mnqSingle := f_request1800(mnqSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+            mesSingle := f_request1800(mesSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+        else if maximumHistoricalSignals == 30
+            mnqSingle := f_request2600(mnqSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+            mesSingle := f_request2600(mesSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+        else if maximumHistoricalSignals == 50
+            mnqSingle := f_request4200(mnqSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+            mesSingle := f_request4200(mesSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+        else
+            mnqSingle := f_request8000(mnqSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+            mesSingle := f_request8000(mesSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+        // Previous closed candle first, then the current one. Both pass through the
+        // same newSourceBar gate, so a candle is never processed twice.
+        if not na(mnqSingle) and not na(mesSingle)
+            SourceBundle mnqPrevious = f_previousBundle(mnqSingle)
+            SourceBundle mesPrevious = f_previousBundle(mesSingle)
+            if not na(mnqPrevious) and not na(mesPrevious)
+                array.push(mnqBars, mnqPrevious)
+                array.push(mesBars, mesPrevious)
+        if not na(mnqSingle)
+            array.push(mnqBars, mnqSingle)
+        if not na(mesSingle)
+            array.push(mesBars, mesSingle)
+    else if maximumHistoricalSignals == 10
+        mnqBars := f_requestLower900(mnqSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+        mesBars := f_requestLower900(mesSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+    else if maximumHistoricalSignals == 20
+        mnqBars := f_requestLower1800(mnqSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+        mesBars := f_requestLower1800(mesSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+    else if maximumHistoricalSignals == 30
+        mnqBars := f_requestLower2600(mnqSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+        mesBars := f_requestLower2600(mesSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+    else if maximumHistoricalSignals == 50
+        mnqBars := f_requestLower4200(mnqSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+        mesBars := f_requestLower4200(mesSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+    else
+        mnqBars := f_requestLower8000(mnqSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+        mesBars := f_requestLower8000(mesSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+    int mnqIndex = 0
+    int mesIndex = 0
+    while mnqIndex < array.size(mnqBars) and mesIndex < array.size(mesBars)
+        SourceBundle mnqSource = array.get(mnqBars, mnqIndex)
+        SourceBundle mesSource = array.get(mesBars, mesIndex)
+        if na(mnqSource) or na(mesSource)
+            mnqIndex += 1
+            mesIndex += 1
+        else if mnqSource.sourceTime == mesSource.sourceTime and mnqSource.sourceClose == mesSource.sourceClose
+            float mnqHigh = mnqSource.highValue
+            float mnqLow = mnqSource.lowValue
+            float mnqClosePrice = mnqSource.closeValue
+            int mnqTime = mnqSource.sourceTime
+            int mnqClose = mnqSource.sourceClose
+            float mnqTick = mnqSource.tickSize
+            float mnqHighPivot = mnqSource.pivotHigh
+            int mnqHighPivotTime = mnqSource.pivotHighTime
+            float mnqLowPivot = mnqSource.pivotLow
+            int mnqLowPivotTime = mnqSource.pivotLowTime
+            float mnqATR = mnqSource.atrValue
+            float mesHigh = mesSource.highValue
+            float mesLow = mesSource.lowValue
+            float mesClosePrice = mesSource.closeValue
+            float chartConfirmationClose = drawUsingMNQPrices ? mnqClosePrice : mesClosePrice
+            int mesTime = mesSource.sourceTime
+            int mesClose = mesSource.sourceClose
+            float mesTick = mesSource.tickSize
+            float mesHighPivot = mesSource.pivotHigh
+            int mesHighPivotTime = mesSource.pivotHighTime
+            float mesLowPivot = mesSource.pivotLow
+            int mesLowPivotTime = mesSource.pivotLowTime
+            float mesATR = mesSource.atrValue
+            bool mnqClosed = not na(mnqTime) and not na(mnqClose) and mnqClose <= timenow
+            bool mesClosed = not na(mesTime) and not na(mesClose) and mesClose <= timenow
+            bool sourceAligned = not na(mnqTime) and not na(mesTime) and not na(mnqClose) and not na(mesClose) and mnqTime == mesTime and mnqClose == mesClose
+            bool sourceSynchronized = sourceAligned and mnqClosed and mesClosed
+            bool newSourceBar = sourceSynchronized and (na(lastSourceClose) or mnqClose > lastSourceClose)
+            if newSourceBar
+                lastSourceClose := mnqClose
+                lastDebugSourceClose := mnqClose
+                int sourceCandleCapacity = maxSwingDistanceBars + 2 * swingToleranceBars + drawingPivotStrength + 3
+                f_pushSourceCandle(mnqSourceCandles,
+                     SourceCandle.new(mnqTime, mnqClose, mnqHigh, mnqLow), sourceCandleCapacity)
+                f_pushSourceCandle(mesSourceCandles,
+                     SourceCandle.new(mesTime, mesClose, mesHigh, mesLow), sourceCandleCapacity)
+                int alertSourceCandleCapacity = maxSwingDistanceBars + 2 * swingToleranceBars + alertPivotStrength + 3
+                f_pushSourceCandle(alertMNQSourceCandles,
+                     SourceCandle.new(mnqTime, mnqClose, mnqHigh, mnqLow), alertSourceCandleCapacity)
+                f_pushSourceCandle(alertMESSourceCandles,
+                     SourceCandle.new(mesTime, mesClose, mesHigh, mesLow), alertSourceCandleCapacity)
+                // Independent alert-pivot engine. Pivot alerts are evaluated on
+                // this aligned, closed 5M MNQ/MES source pair only.
+                float mnqAlertHighPivot = mnqSource.alertPivotHigh
+                int mnqAlertHighPivotTime = mnqSource.alertPivotHighTime
+                float mnqAlertLowPivot = mnqSource.alertPivotLow
+                int mnqAlertLowPivotTime = mnqSource.alertPivotLowTime
+                float mesAlertHighPivot = mesSource.alertPivotHigh
+                int mesAlertHighPivotTime = mesSource.alertPivotHighTime
+                float mesAlertLowPivot = mesSource.alertPivotLow
+                int mesAlertLowPivotTime = mesSource.alertPivotLowTime
+                bool newAlertMNQHigh = enableAlerts and enableBearishAlerts and not na(mnqAlertHighPivotTime) and (na(lastAlertMNQHighPivotTime) or mnqAlertHighPivotTime != lastAlertMNQHighPivotTime)
+                bool newAlertMESHigh = enableAlerts and enableBearishAlerts and not na(mesAlertHighPivotTime) and (na(lastAlertMESHighPivotTime) or mesAlertHighPivotTime != lastAlertMESHighPivotTime)
+                bool newAlertMNQLow = enableAlerts and enableBullishAlerts and not na(mnqAlertLowPivotTime) and (na(lastAlertMNQLowPivotTime) or mnqAlertLowPivotTime != lastAlertMNQLowPivotTime)
+                bool newAlertMESLow = enableAlerts and enableBullishAlerts and not na(mesAlertLowPivotTime) and (na(lastAlertMESLowPivotTime) or mesAlertLowPivotTime != lastAlertMESLowPivotTime)
+                if newAlertMNQHigh
+                    lastAlertMNQHighPivotTime := mnqAlertHighPivotTime
+                    f_pushPivot(alertMNQHighQueue, mnqAlertHighPivot, mnqAlertHighPivotTime, alertPivotQueueCapacity)
+                if newAlertMESHigh
+                    lastAlertMESHighPivotTime := mesAlertHighPivotTime
+                    f_pushPivot(alertMESHighQueue, mesAlertHighPivot, mesAlertHighPivotTime, alertPivotQueueCapacity)
+                if newAlertMNQLow
+                    lastAlertMNQLowPivotTime := mnqAlertLowPivotTime
+                    f_pushPivot(alertMNQLowQueue, mnqAlertLowPivot, mnqAlertLowPivotTime, alertPivotQueueCapacity)
+                if newAlertMESLow
+                    lastAlertMESLowPivotTime := mesAlertLowPivotTime
+                    f_pushPivot(alertMESLowQueue, mesAlertLowPivot, mesAlertLowPivotTime, alertPivotQueueCapacity)
+                int alertQueueAgeMs = (swingToleranceBars + alertPivotStrength + 1) * SOURCE_MS
+                // Independent alert-pivot validation caused alerts to diverge from drawn SMTs.
+                // Keep its legacy calculations inert; validated drawing events are queued below.
+                if enableAlerts and enableBearishAlerts and false
+                    [alertHighMatched, alertHighMNQTime, alertHighMNQPrice, alertHighMESTime, alertHighMESPrice, alertHighComparedMNQTime, alertHighComparedMESTime] = f_takeMatchedPivot(alertMNQHighQueue, alertMESHighQueue, swingToleranceBars * SOURCE_MS, mnqTime, alertQueueAgeMs)
+                    if alertHighMatched
+                        bool hasAlertHighReference = not na(alertReferenceMNQHighTime) and not na(alertReferenceMESHighTime) and not na(alertReferenceMNQHigh) and not na(alertReferenceMESHigh)
+                        bool alertHighChronological = hasAlertHighReference and alertHighMNQTime > alertReferenceMNQHighTime and alertHighMESTime > alertReferenceMESHighTime
+                        int alertHighPairTime = math.max(alertHighMNQTime, alertHighMESTime)
+                        int alertHighPriorPairTime = hasAlertHighReference ? math.max(alertReferenceMNQHighTime, alertReferenceMESHighTime) : na
+                        bool alertHighWithinDistance = alertHighChronological and alertHighPairTime - alertHighPriorPairTime <= maxSwingDistanceBars * SOURCE_MS
+                        bool alertMNQHH = hasAlertHighReference and alertHighMNQPrice > alertReferenceMNQHigh
+                        bool alertMESHH = hasAlertHighReference and alertHighMESPrice > alertReferenceMESHigh
+                        bool alertBearishDivergence = alertMNQHH != alertMESHH
+                        bool alertHighClear = false
+                        if hasAlertHighReference and alertHighWithinDistance and alertBearishDivergence
+                            alertHighClear := f_segmentClear(alertMNQSourceCandles, alertReferenceMNQHighTime, alertReferenceMNQHigh, alertHighMNQTime, alertHighMNQPrice, true) and f_segmentClear(alertMESSourceCandles, alertReferenceMESHighTime, alertReferenceMESHigh, alertHighMESTime, alertHighMESPrice, true)
+                        if hasAlertHighReference and alertHighWithinDistance and alertBearishDivergence and alertHighClear
+                            bool alertMNQSweptHigh = alertMNQHH
+                            float alertSweepDistance = alertMNQSweptHigh ? alertHighMNQPrice - alertReferenceMNQHigh : alertHighMESPrice - alertReferenceMESHigh
+                            float alertHeldDistance = alertMNQSweptHigh ? alertReferenceMESHigh - alertHighMESPrice : alertReferenceMNQHigh - alertHighMNQPrice
+                            float alertSweepATR = alertMNQSweptHigh ? mnqATR : mesATR
+                            float alertHeldATR = alertMNQSweptHigh ? mesATR : mnqATR
+                            float alertSweepTick = alertMNQSweptHigh ? mnqTick : mesTick
+                            float alertStrengthPct = not na(alertSweepATR) and alertSweepATR > 0 and not na(alertHeldATR) and alertHeldATR > 0 ? math.min(100.0, 50.0 * (alertSweepDistance / alertSweepATR + alertHeldDistance / alertHeldATR)) : na
+                            bool alertTickPass = not na(alertSweepTick) and alertSweepTick > 0 and alertSweepDistance / alertSweepTick >= minimumDivergenceTicks
+                            bool alertPercentPass = not useMinimumPercentDifference or math.abs(100.0 * (alertHighMNQPrice - alertReferenceMNQHigh) / alertReferenceMNQHigh - 100.0 * (alertHighMESPrice - alertReferenceMESHigh) / alertReferenceMESHigh) >= minimumPercentDifference
+                            bool alertStrengthPass = not na(alertStrengthPct) and alertStrengthPct >= minimumStrength
+                            string alertEventKey = "AS:" + str.tostring(alertPivotStrength) + ":" + str.tostring(alertReferenceMNQHighTime) + ":" + str.tostring(alertReferenceMESHighTime) + ">" + str.tostring(alertHighMNQTime) + ":" + str.tostring(alertHighMESTime) + ":C:" + str.tostring(mnqClose)
+                            if alertTickPass and alertPercentPass and alertStrengthPass and not array.includes(alertProcessedKeys, alertEventKey) and array.size(pendingAlerts) < pendingAlertCapacity
+                                array.push(alertProcessedKeys, alertEventKey)
+                                while array.size(alertProcessedKeys) > 512
+                                    array.shift(alertProcessedKeys)
+                                array.push(pendingAlerts, PendingSmt.new(alertEventKey, false, "5", mnqClose, chartConfirmationClose, 0, false))
+                            if not hasAlertHighReference or alertHighChronological
+                                alertReferenceMNQHighTime := alertHighMNQTime
+                                alertReferenceMNQHigh := alertHighMNQPrice
+                                alertReferenceMESHighTime := alertHighMESTime
+                                alertReferenceMESHigh := alertHighMESPrice
+                if enableAlerts and enableBullishAlerts and false
+                    [alertLowMatched, alertLowMNQTime, alertLowMNQPrice, alertLowMESTime, alertLowMESPrice, alertLowComparedMNQTime, alertLowComparedMESTime] = f_takeMatchedPivot(alertMNQLowQueue, alertMESLowQueue, swingToleranceBars * SOURCE_MS, mnqTime, alertQueueAgeMs)
+                    if alertLowMatched
+                        bool hasAlertLowReference = not na(alertReferenceMNQLowTime) and not na(alertReferenceMESLowTime) and not na(alertReferenceMNQLow) and not na(alertReferenceMESLow)
+                        bool alertLowChronological = hasAlertLowReference and alertLowMNQTime > alertReferenceMNQLowTime and alertLowMESTime > alertReferenceMESLowTime
+                        int alertLowPairTime = math.max(alertLowMNQTime, alertLowMESTime)
+                        int alertLowPriorPairTime = hasAlertLowReference ? math.max(alertReferenceMNQLowTime, alertReferenceMESLowTime) : na
+                        bool alertLowWithinDistance = alertLowChronological and alertLowPairTime - alertLowPriorPairTime <= maxSwingDistanceBars * SOURCE_MS
+                        bool alertMNQLL = hasAlertLowReference and alertLowMNQPrice < alertReferenceMNQLow
+                        bool alertMESLL = hasAlertLowReference and alertLowMESPrice < alertReferenceMESLow
+                        bool alertBullishDivergence = alertMNQLL != alertMESLL
+                        bool alertLowClear = false
+                        if hasAlertLowReference and alertLowWithinDistance and alertBullishDivergence
+                            alertLowClear := f_segmentClear(alertMNQSourceCandles, alertReferenceMNQLowTime, alertReferenceMNQLow, alertLowMNQTime, alertLowMNQPrice, false) and f_segmentClear(alertMESSourceCandles, alertReferenceMESLowTime, alertReferenceMESLow, alertLowMESTime, alertLowMESPrice, false)
+                        if hasAlertLowReference and alertLowWithinDistance and alertBullishDivergence and alertLowClear
+                            bool alertMNQSweptLow = alertMNQLL
+                            float alertSweepDistance = alertMNQSweptLow ? alertReferenceMNQLow - alertLowMNQPrice : alertReferenceMESLow - alertLowMESPrice
+                            float alertHeldDistance = alertMNQSweptLow ? alertLowMESPrice - alertReferenceMESLow : alertLowMNQPrice - alertReferenceMNQLow
+                            float alertSweepATR = alertMNQSweptLow ? mnqATR : mesATR
+                            float alertHeldATR = alertMNQSweptLow ? mesATR : mnqATR
+                            float alertSweepTick = alertMNQSweptLow ? mnqTick : mesTick
+                            float alertStrengthPct = not na(alertSweepATR) and alertSweepATR > 0 and not na(alertHeldATR) and alertHeldATR > 0 ? math.min(100.0, 50.0 * (alertSweepDistance / alertSweepATR + alertHeldDistance / alertHeldATR)) : na
+                            bool alertTickPass = not na(alertSweepTick) and alertSweepTick > 0 and alertSweepDistance / alertSweepTick >= minimumDivergenceTicks
+                            bool alertPercentPass = not useMinimumPercentDifference or math.abs(100.0 * (alertReferenceMNQLow - alertLowMNQPrice) / alertReferenceMNQLow - 100.0 * (alertReferenceMESLow - alertLowMESPrice) / alertReferenceMESLow) >= minimumPercentDifference
+                            bool alertStrengthPass = not na(alertStrengthPct) and alertStrengthPct >= minimumStrength
+                            string alertEventKey = "AB:" + str.tostring(alertPivotStrength) + ":" + str.tostring(alertReferenceMNQLowTime) + ":" + str.tostring(alertReferenceMESLowTime) + ">" + str.tostring(alertLowMNQTime) + ":" + str.tostring(alertLowMESTime) + ":C:" + str.tostring(mnqClose)
+                            if alertTickPass and alertPercentPass and alertStrengthPass and not array.includes(alertProcessedKeys, alertEventKey) and array.size(pendingAlerts) < pendingAlertCapacity
+                                array.push(alertProcessedKeys, alertEventKey)
+                                while array.size(alertProcessedKeys) > 512
+                                    array.shift(alertProcessedKeys)
+                                array.push(pendingAlerts, PendingSmt.new(alertEventKey, true, "5", mnqClose, chartConfirmationClose, 0, false))
+                            if not hasAlertLowReference or alertLowChronological
+                                alertReferenceMNQLowTime := alertLowMNQTime
+                                alertReferenceMNQLow := alertLowMNQPrice
+                                alertReferenceMESLowTime := alertLowMESTime
+                                alertReferenceMESLow := alertLowMESPrice
+                bool newMNQHighPivot = needBearishEngine and not na(mnqHighPivotTime) and (na(lastMNQHighPivotTime) or mnqHighPivotTime != lastMNQHighPivotTime)
+                bool newMESHighPivot = needBearishEngine and not na(mesHighPivotTime) and (na(lastMESHighPivotTime) or mesHighPivotTime != lastMESHighPivotTime)
+                bool newMNQLowPivot = needBullishEngine and not na(mnqLowPivotTime) and (na(lastMNQLowPivotTime) or mnqLowPivotTime != lastMNQLowPivotTime)
+                bool newMESLowPivot = needBullishEngine and not na(mesLowPivotTime) and (na(lastMESLowPivotTime) or mesLowPivotTime != lastMESLowPivotTime)
+                if newMNQHighPivot
+                    lastMNQHighPivotTime := mnqHighPivotTime
+                    mnqPivotCount += 1
+                    f_pushPivot(mnqHighQueue, mnqHighPivot, mnqHighPivotTime, pivotQueueCapacity)
+                if newMESHighPivot
+                    lastMESHighPivotTime := mesHighPivotTime
+                    mesPivotCount += 1
+                    f_pushPivot(mesHighQueue, mesHighPivot, mesHighPivotTime, pivotQueueCapacity)
+                if newMNQLowPivot
+                    lastMNQLowPivotTime := mnqLowPivotTime
+                    mnqPivotCount += 1
+                    f_pushPivot(mnqLowQueue, mnqLowPivot, mnqLowPivotTime, pivotQueueCapacity)
+                if newMESLowPivot
+                    lastMESLowPivotTime := mesLowPivotTime
+                    mesPivotCount += 1
+                    f_pushPivot(mesLowQueue, mesLowPivot, mesLowPivotTime, pivotQueueCapacity)
+                if newMNQHighPivot or newMESHighPivot
+                    debugHighPair := "MNQ " + f_debugTime(lastMNQHighPivotTime) + " / MES " + f_debugTime(lastMESHighPivotTime)
+                    debugHighSync := "waiting for confirmed one-to-one match"
+                if newMNQLowPivot or newMESLowPivot
+                    debugLowPair := "MNQ " + f_debugTime(lastMNQLowPivotTime) + " / MES " + f_debugTime(lastMESLowPivotTime)
+                    debugLowSync := "waiting for confirmed one-to-one match"
+                // Match confirmed pivot highs one-to-one, then compare this matched
+                // swing pair with the prior matched swing pair. Candle wicks alone can
+                // never create SMT events.
+                int toleranceMs = swingToleranceBars * SOURCE_MS
+                int queueAgeMs = (swingToleranceBars + drawingPivotStrength + 1) * SOURCE_MS
+                // Sweep-based SMT. Matched confirmed pivot pairs become active
+                // reference levels. A closed, synchronized 5M candle on which exactly one
+                // market takes its reference (and the other market has never taken its
+                // own) is the SMT event. The drawing and the alert below are both built
+                // from this single validated event.
+                int maxReferenceAgeMs = maxSwingDistanceBars * SOURCE_MS
+                if needBearishEngine
+                    [highMatched, highMNQTime, highMNQPrice, highMESTime, highMESPrice, highComparedMNQTime, highComparedMESTime] =
+                         f_takeMatchedPivot(mnqHighQueue, mesHighQueue, toleranceMs, mnqTime, queueAgeMs)
+                    if not na(highComparedMNQTime) and not na(highComparedMESTime)
+                        debugHighPair := "MNQ " + f_debugTime(highComparedMNQTime) + " / MES " + f_debugTime(highComparedMESTime)
+                        debugHighSync := highMatched ? "PASS (within " + str.tostring(swingToleranceBars) + " bars)" : "FAIL (outside tolerance / waiting)"
+                    if highMatched
+                        matchedHighCount += 1
+                        debugHighPair := "MNQ " + f_debugTime(highMNQTime) + " @ " + str.tostring(highMNQPrice, format.mintick) +
+                             " | MES " + f_debugTime(highMESTime) + " @ " + str.tostring(highMESPrice, format.mintick)
+                        bool highRegistered = f_registerReference(activeHighReferences, mnqSourceCandles, mesSourceCandles, true,
+                             highMNQTime, highMNQPrice, highMESTime, highMESPrice, mnqClose, REFERENCE_CAPACITY)
+                        debugSignalStatus := highRegistered ? "High pair registered as active sweep reference" :
+                             "High pair already taken by both markets; not registered"
+                    else if not na(highComparedMNQTime) and not na(highComparedMESTime)
+                        debugSignalStatus := "High pivots not matched; no reference registered"
+                    [bearFound, bearRefMNQTime, bearRefMNQPrice, bearRefMESTime, bearRefMESPrice, bearSweepTime,
+                         bearEndMNQPrice, bearEndMESPrice, bearMNQSwept, bearDivergedCount, bearReason] =
+                         f_evaluateSweeps(activeHighReferences, mnqSourceCandles, mesSourceCandles, true, mnqTime, mnqClose,
+                         mnqHigh, mesHigh, mnqATR, mesATR, mnqTick, mesTick, maxReferenceAgeMs)
+                    if bearFound
+                        string eventKey = "S:" + str.tostring(bearRefMNQTime) + ":" + str.tostring(bearRefMESTime) + ">" + str.tostring(bearSweepTime) + ":" + str.tostring(bearSweepTime) + ":C:" + str.tostring(mnqClose)
+                        if not array.includes(processedEventKeys, eventKey)
+                            array.push(processedEventKeys, eventKey)
+                            while array.size(processedEventKeys) > 512
+                                array.shift(processedEventKeys)
+                            bearishSignalCount += 1
+                            debugSignalStatus := "BEARISH SMT confirmed: " + (bearMNQSwept ? "MNQ swept high; MES held" : "MES swept high; MNQ held")
+                            // The drawing and the alert share this one validated event.
+                            if enableAlerts and enableBearishAlerts and not array.includes(alertProcessedKeys, eventKey)
+                                array.push(alertProcessedKeys, eventKey)
+                                while array.size(alertProcessedKeys) > 512
+                                    array.shift(alertProcessedKeys)
+                                array.push(pendingAlerts, PendingSmt.new(eventKey, false, "5", mnqClose, chartConfirmationClose, 0, false))
+                            int lineStartTime = drawUsingMNQPrices ? bearRefMNQTime : bearRefMESTime
+                            float lineStartPrice = drawUsingMNQPrices ? bearRefMNQPrice : bearRefMESPrice
+                            float lineEndPrice = drawUsingMNQPrices ? bearEndMNQPrice : bearEndMESPrice
+                            if showHistoricalLines and drawingsVisible and showBearishLines
+                                DrawSmt drawing = DrawSmt.new(false, mnqClose, lineStartTime, lineStartPrice, bearSweepTime, lineEndPrice)
+                                f_recordDraw(historicalDraws, pendingDraws, drawing, maximumHistoricalSignals, showOnlyLatest, barstate.ishistory)
+                    else if bearDivergedCount > 0
+                        debugSignalStatus := "Bearish sweep not confirmed: " + bearReason
+                // Bullish SMT uses the same reference/sweep logic on confirmed lows.
+                if needBullishEngine
+                    [lowMatched, lowMNQTime, lowMNQPrice, lowMESTime, lowMESPrice, lowComparedMNQTime, lowComparedMESTime] =
+                         f_takeMatchedPivot(mnqLowQueue, mesLowQueue, toleranceMs, mnqTime, queueAgeMs)
+                    if not na(lowComparedMNQTime) and not na(lowComparedMESTime)
+                        debugLowPair := "MNQ " + f_debugTime(lowComparedMNQTime) + " / MES " + f_debugTime(lowComparedMESTime)
+                        debugLowSync := lowMatched ? "PASS (within " + str.tostring(swingToleranceBars) + " bars)" : "FAIL (outside tolerance / waiting)"
+                    if lowMatched
+                        matchedLowCount += 1
+                        debugLowPair := "MNQ " + f_debugTime(lowMNQTime) + " @ " + str.tostring(lowMNQPrice, format.mintick) +
+                             " | MES " + f_debugTime(lowMESTime) + " @ " + str.tostring(lowMESPrice, format.mintick)
+                        bool lowRegistered = f_registerReference(activeLowReferences, mnqSourceCandles, mesSourceCandles, false,
+                             lowMNQTime, lowMNQPrice, lowMESTime, lowMESPrice, mnqClose, REFERENCE_CAPACITY)
+                        debugSignalStatus := lowRegistered ? "Low pair registered as active sweep reference" :
+                             "Low pair already taken by both markets; not registered"
+                    else if not na(lowComparedMNQTime) and not na(lowComparedMESTime)
+                        debugSignalStatus := "Low pivots not matched; no reference registered"
+                    [bullFound, bullRefMNQTime, bullRefMNQPrice, bullRefMESTime, bullRefMESPrice, bullSweepTime,
+                         bullEndMNQPrice, bullEndMESPrice, bullMNQSwept, bullDivergedCount, bullReason] =
+                         f_evaluateSweeps(activeLowReferences, mnqSourceCandles, mesSourceCandles, false, mnqTime, mnqClose,
+                         mnqLow, mesLow, mnqATR, mesATR, mnqTick, mesTick, maxReferenceAgeMs)
+                    if bullFound
+                        string eventKey = "B:" + str.tostring(bullRefMNQTime) + ":" + str.tostring(bullRefMESTime) + ">" + str.tostring(bullSweepTime) + ":" + str.tostring(bullSweepTime) + ":C:" + str.tostring(mnqClose)
+                        if not array.includes(processedEventKeys, eventKey)
+                            array.push(processedEventKeys, eventKey)
+                            while array.size(processedEventKeys) > 512
+                                array.shift(processedEventKeys)
+                            bullishSignalCount += 1
+                            debugSignalStatus := "BULLISH SMT confirmed: " + (bullMNQSwept ? "MNQ swept low; MES held" : "MES swept low; MNQ held")
+                            // The drawing and the alert share this one validated event.
+                            if enableAlerts and enableBullishAlerts and not array.includes(alertProcessedKeys, eventKey)
+                                array.push(alertProcessedKeys, eventKey)
+                                while array.size(alertProcessedKeys) > 512
+                                    array.shift(alertProcessedKeys)
+                                array.push(pendingAlerts, PendingSmt.new(eventKey, true, "5", mnqClose, chartConfirmationClose, 0, false))
+                            int lineStartTime = drawUsingMNQPrices ? bullRefMNQTime : bullRefMESTime
+                            float lineStartPrice = drawUsingMNQPrices ? bullRefMNQPrice : bullRefMESPrice
+                            float lineEndPrice = drawUsingMNQPrices ? bullEndMNQPrice : bullEndMESPrice
+                            if showHistoricalLines and drawingsVisible and showBullishLines
+                                DrawSmt drawing = DrawSmt.new(true, mnqClose, lineStartTime, lineStartPrice, bullSweepTime, lineEndPrice)
+                                f_recordDraw(historicalDraws, pendingDraws, drawing, maximumHistoricalSignals, showOnlyLatest, barstate.ishistory)
+                    else if bullDivergedCount > 0
+                        debugSignalStatus := "Bullish sweep not confirmed: " + bullReason
+                // Pending alerts advance only on closed 5M source candles, so the
+                // delay counts real 5M candle closes.
+                f_processPendingAlerts(pendingAlerts, alertedKeys, mnqClose,
+                     candleClosesBeforeAlert, enableAlerts, enableBullishAlerts, enableBearishAlerts)
+            mnqIndex += 1
+            mesIndex += 1
+        else if mnqSource.sourceTime < mesSource.sourceTime
+            mnqIndex += 1
+        else if mnqSource.sourceTime > mesSource.sourceTime
+            mesIndex += 1
+        else if mnqSource.sourceClose < mesSource.sourceClose
+            mnqIndex += 1
+        else
+            mesIndex += 1
+// During initial history processing, retain only the latest N event records
+// and create those drawings once at the last historical bar. Live 5M events
+// remain queued until the host chart bar confirms, so source closes inside a chart candle are retained.
+if barstate.islastconfirmedhistory and array.size(historicalDraws) > 0
+    while array.size(historicalDraws) > 0
+        DrawSmt historicalDrawing = array.shift(historicalDraws)
+        f_renderDraw(historicalDrawing, smtLines, drawnKeys, maximumHistoricalSignals,
+             showOnlyLatest, showHistoricalLines, bullishColor, bearishColor, lineTransparency, lineWidth)
+if barstate.isconfirmed and array.size(pendingDraws) > 0
+    while array.size(pendingDraws) > 0
+        DrawSmt drawing = array.shift(pendingDraws)
+        f_renderDraw(drawing, smtLines, drawnKeys, maximumHistoricalSignals,
+             showOnlyLatest, showHistoricalLines, bullishColor, bearishColor, lineTransparency, lineWidth)
+//====================================================
+// Optional, low-overhead debug table
+//====================================================
+var table debugTable = table.new(position.top_right, 2, 16, border_width=1)
+if barstate.islast and debugMode
+    table.cell(debugTable, 0, 0, "5M SMT Debug", text_color=color.white, bgcolor=color.new(color.blue, 55))
+    table.cell(debugTable, 1, 0, "Value", text_color=color.white, bgcolor=color.new(color.blue, 55))
+    table.cell(debugTable, 0, 1, "Chart market", text_color=color.white)
+    table.cell(debugTable, 1, 1, chartIsMNQ ? "MNQ" : chartIsMES ? "MES" : "unsupported", text_color=color.white)
+    table.cell(debugTable, 0, 2, "Engine active", text_color=color.white)
+    table.cell(debugTable, 1, 2, canRunEngine ? "yes" : "no", text_color=color.white)
+    table.cell(debugTable, 0, 3, "Latest MNQ H / L", text_color=color.white)
+    table.cell(debugTable, 1, 3, f_debugTime(lastMNQHighPivotTime) + " / " + f_debugTime(lastMNQLowPivotTime), text_color=color.white)
+    table.cell(debugTable, 0, 4, "Latest MES H / L", text_color=color.white)
+    table.cell(debugTable, 1, 4, f_debugTime(lastMESHighPivotTime) + " / " + f_debugTime(lastMESLowPivotTime), text_color=color.white)
+    table.cell(debugTable, 0, 5, "High pivots compared", text_color=color.white)
+    table.cell(debugTable, 1, 5, debugHighPair, text_color=color.white)
+    table.cell(debugTable, 0, 6, "High pair sync", text_color=color.white)
+    table.cell(debugTable, 1, 6, debugHighSync, text_color=color.white)
+    table.cell(debugTable, 0, 7, "Low pivots compared", text_color=color.white)
+    table.cell(debugTable, 1, 7, debugLowPair, text_color=color.white)
+    table.cell(debugTable, 0, 8, "Low pair sync", text_color=color.white)
+    table.cell(debugTable, 1, 8, debugLowSync, text_color=color.white)
+    table.cell(debugTable, 0, 9, "MNQ / MES pivots", text_color=color.white)
+    table.cell(debugTable, 1, 9, str.tostring(mnqPivotCount) + " / " + str.tostring(mesPivotCount), text_color=color.white)
+    table.cell(debugTable, 0, 10, "Matched H / L", text_color=color.white)
+    table.cell(debugTable, 1, 10, str.tostring(matchedHighCount) + " / " + str.tostring(matchedLowCount), text_color=color.white)
+    table.cell(debugTable, 0, 11, "Bull / bear SMT", text_color=color.white)
+    table.cell(debugTable, 1, 11, str.tostring(bullishSignalCount) + " / " + str.tostring(bearishSignalCount), text_color=color.white)
+    table.cell(debugTable, 0, 12, "Latest SMT validation", text_color=color.white)
+    table.cell(debugTable, 1, 12, debugSignalStatus, text_color=color.white)
+    table.cell(debugTable, 0, 13, "Alert state", text_color=color.white)
+    table.cell(debugTable, 1, 13, debugAlertStatus, text_color=color.white)
+    table.cell(debugTable, 0, 14, "Alert reason", text_color=color.white)
+    table.cell(debugTable, 1, 14, debugAlertReason, text_color=color.white)
+    table.cell(debugTable, 0, 15, "Last source close (NY)", text_color=color.white)
+    table.cell(debugTable, 1, 15, na(lastDebugSourceClose) ? "—" : str.format_time(lastDebugSourceClose, "MM-dd HH:mm", "America/New_York"), text_color=color.white)

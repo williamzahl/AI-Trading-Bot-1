@@ -9,7 +9,7 @@ from sqlalchemy import text
 
 from app import config, telegram_bot
 from app.db import engine, init_db
-from app.signals import latest_signals, parse_side, save_signal
+from app.signals import latest_signals, parse_text, save_signal
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("smt-bot")
@@ -76,7 +76,7 @@ async def tradingview_webhook(request: Request, background: BackgroundTasks):
         # Ren tekst, f.eks. fra eksisterende alert()-kall i egne indikatorer.
         # Da maa noekkelen ligge i URL-en: ...?key=SECRET&indicator=SMT-5M
         text_msg = body.decode("utf-8", errors="replace").strip()
-        data = {"message": text_msg, "signal": parse_side(text_msg), "format": "text"}
+        data = parse_text(text_msg)
 
     # URL-parametre fyller inn det meldingen mangler (indicator, instrument, ...)
     for k in ("indicator", "instrument", "timeframe", "signal"):

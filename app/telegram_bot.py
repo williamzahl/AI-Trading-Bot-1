@@ -74,6 +74,14 @@ def signal_text(sig: Signal) -> str:
     msg = (sig.raw or {}).get("message") if isinstance(sig.raw, dict) else None
     if msg:
         lines.insert(2, f"Melding: {html.escape(msg[:500])}")
+    raw = sig.raw if isinstance(sig.raw, dict) else {}
+    if "bias" in raw:
+        trend = {"UP": "OPP 📈", "DOWN": "NED 📉"}.get(raw["bias"], "INGEN ➖")
+        chg = raw.get("change_24h_pct")
+        chg_txt = f" ({chg:+.2f}% 24t)" if isinstance(chg, (int, float)) else ""
+        lines.append(f"Trend: {trend}{chg_txt}")
+        if raw.get("trend_aligned") is False:
+            lines.append("⚠️ Mot trend / ingen trend: kun info, ingen knapper")
     if sig.status not in ("NEW", "INFO"):
         d = sig.decided_at.strftime("%H:%M:%S UTC") if sig.decided_at else ""
         mark = "✅ GODKJENT" if sig.status == "APPROVED" else "❌ AVVIST"

@@ -13,6 +13,26 @@ _BUY = re.compile(r"\b(buy|long|bull|bullish)\b", re.I)
 _SELL = re.compile(r"\b(sell|short|bear|bearish)\b", re.I)
 
 
+_BIAS = re.compile(r"bias=(UP|DOWN|NONE)", re.I)
+_CHG = re.compile(r"24t:\s*([+-]?\d+(?:\.\d+)?)%")
+_PRICE = re.compile(r"[–-]\s*(\d+(?:\.\d+)?)\s*(?:\||$)")
+
+
+def parse_text(text: str) -> dict:
+    """Hent retning, pris og 24t-trend fra en tekstmelding fra en indikator."""
+    out = {"message": text, "signal": parse_side(text), "format": "text"}
+    if m := _PRICE.search(text):
+        out["price"] = m.group(1)
+    if m := _CHG.search(text):
+        out["change_24h_pct"] = float(m.group(1))
+    if m := _BIAS.search(text):
+        bias = m.group(1).upper()
+        out["bias"] = bias
+        side = out["signal"]
+        out["trend_aligned"] = (side == "BUY" and bias == "UP") or (side == "SELL" and bias == "DOWN")
+    return out
+
+
 def parse_side(text: str) -> str:
     """Finn retning i en tekstmelding. INFO hvis ingen/begge retninger nevnes."""
     b, s = bool(_BUY.search(text)), bool(_SELL.search(text))
@@ -37,6 +57,15 @@ def _to_float(value):
         return None
 
 
+def _initial_status(data: dict) -> str:
+    """NEW = faar APPROVE/REJECT-knapper. INFO = bare informasjon."""
+    if str(_first(data, "signal", "action", "side") or "").upper() == "INFO":
+        return "INFO"
+    if data.get("trend_aligned") is False:  # signal mot trend / ingen trend
+        return "INFO"
+    return "NEW"
+
+
 def save_signal(data: dict, source_ip: str | None) -> Signal:
     clean = {k: v for k, v in data.items() if k != "secret"}  # lagre aldri noekkelen
     sig = Signal(
@@ -47,7 +76,7 @@ def save_signal(data: dict, source_ip: str | None) -> Signal:
         timeframe=_first(data, "timeframe", "interval"),
         bar_time=_first(data, "time", "bar_time"),
         source_ip=source_ip,
-        status="INFO" if str(_first(data, "signal", "action", "side") or "").upper() == "INFO" else "NEW",
+        status=_initial_status(data),
         raw=clean,
     )
     with SessionLocal() as s:
