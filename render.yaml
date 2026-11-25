@@ -18,6 +18,8 @@ services:
         generateValue: true
       - key: TV_IP_ALLOWLIST
         value: "on"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
 
 databases:
   - name: smt-db
