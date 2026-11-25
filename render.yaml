@@ -1,0 +1,30 @@
+# Render Blueprint: oppretter web-tjeneste + PostgreSQL i Oregon (naer TradingView).
+services:
+  - type: web
+    name: smt-bot
+    runtime: python
+    region: oregon
+    plan: 0.5c-512mb          # betalt "Starter" (sover aldri)
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.8"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: smt-db
+          property: connectionString
+      - key: WEBHOOK_SECRET
+        generateValue: true     # Render lager en tilfeldig hemmelig noekkel
+      - key: TV_IP_ALLOWLIST
+        value: "off"            # settes til "on" i steg 7
+
+databases:
+  - name: smt-db
+    databaseName: smt
+    user: smt
+    region: oregon
+    plan: 0.1c-256mb
+    postgresMajorVersion: "17"

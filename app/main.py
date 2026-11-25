@@ -1,0 +1,80 @@
+"""SMT-bot: webhook-mottaker for TradingView."""
+import json
+import logging
+import secrets
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Query, Request
+from sqlalchemy import text
+
+from app import config
+from app.db import engine, init_db
+from app.signals import latest_signals, save_signal
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("smt-bot")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_db()
+    log.info("Database klar. IP-allowlist=%s", config.TV_IP_ALLOWLIST)
+    yield
+
+
+app = FastAPI(title="SMT Bot", lifespan=lifespan)
+
+
+def client_ip(request: Request) -> str | None:
+    # Render staar bak en proxy; ekte avsender-IP er foerste i X-Forwarded-For.
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else None
+
+
+def check_secret(value: str | None) -> None:
+    if not config.WEBHOOK_SECRET or not value or not secrets.compare_digest(
+        str(value), config.WEBHOOK_SECRET
+    ):
+        raise HTTPException(status_code=401, detail="Feil eller manglende secret")
+
+
+@app.get("/")
+def root():
+    return {"service": "smt-bot", "status": "ok"}
+
+
+@app.get("/health")
+def health():
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+    return {"status": "ok", "database": "ok"}
+
+
+@app.post("/webhook/tradingview")
+async def tradingview_webhook(request: Request):
+    ip = client_ip(request)
+    if config.TV_IP_ALLOWLIST and ip not in config.TRADINGVIEW_IPS:
+        log.warning("Avvist IP %s", ip)
+        raise HTTPException(status_code=403, detail="IP ikke tillatt")
+
+    body = await request.body()
+    try:
+        data = json.loads(body)
+        if not isinstance(data, dict):
+            raise ValueError
+    except ValueError:
+        log.warning("Ugyldig JSON fra %s: %r", ip, body[:200])
+        raise HTTPException(status_code=400, detail="Meldingen maa vaere gyldig JSON")
+
+    check_secret(data.get("secret"))
+    sig = save_signal(data, ip)
+    log.info("SIGNAL #%s %s %s %s @ %s", sig.id, sig.instrument, sig.indicator, sig.signal, sig.price)
+    return {"ok": True, "id": sig.id}
+
+
+@app.get("/signals")
+def signals(key: str = Query(...), limit: int = Query(20, ge=1, le=200)):
+    check_secret(key)
+    return latest_signals(limit)
