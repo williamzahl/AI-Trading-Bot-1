@@ -125,7 +125,7 @@ async def telegram_status(key: str = Query(...)):
     return info
 
 
-@app.post("/telegram/reset")
+@app.get("/telegram/reset")
 async def telegram_reset(key: str = Query(...)):
     """Setter Telegram-webhooken paa nytt."""
     check_secret(key)
