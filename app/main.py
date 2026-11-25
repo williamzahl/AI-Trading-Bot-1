@@ -100,3 +100,34 @@ async def telegram_webhook(
     except Exception:
         log.exception("Feil ved behandling av Telegram-oppdatering")
     return {"ok": True}
+
+
+@app.get("/telegram/status")
+async def telegram_status(key: str = Query(...)):
+    """Feilsoeking: viser om Telegram er satt opp riktig (uten aa vise token)."""
+    check_secret(key)
+    info: dict = {
+        "token_satt": telegram_bot.enabled(),
+        "public_url": config.PUBLIC_URL or None,
+        "forventet_webhook": (config.PUBLIC_URL + telegram_bot.WEBHOOK_PATH) if config.PUBLIC_URL else None,
+        "eier_chat_id": telegram_bot.owner_chat_id(),
+    }
+    if telegram_bot.enabled():
+        me = await telegram_bot.call("getMe")
+        info["bot"] = (me.get("result") or {}).get("username") or me.get("description")
+        wh = await telegram_bot.call("getWebhookInfo")
+        r = wh.get("result") or {}
+        info["telegram_webhook"] = {
+            "url": r.get("url"),
+            "ventende_meldinger": r.get("pending_update_count"),
+            "siste_feil": r.get("last_error_message"),
+        }
+    return info
+
+
+@app.post("/telegram/reset")
+async def telegram_reset(key: str = Query(...)):
+    """Setter Telegram-webhooken paa nytt."""
+    check_secret(key)
+    await telegram_bot.setup_webhook()
+    return await telegram_status(key)
