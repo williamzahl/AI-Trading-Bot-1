@@ -17,7 +17,7 @@ services:
       - key: WEBHOOK_SECRET
         generateValue: true
       - key: TV_IP_ALLOWLIST
-        value: "off"
+        value: "on"
 
 databases:
   - name: smt-db
