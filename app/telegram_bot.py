@@ -1,5 +1,6 @@
 """Telegram: sender signaler med APPROVE/REJECT-knapper og tar imot svarene."""
 import hashlib
+import html
 import logging
 from datetime import datetime, timezone
 
@@ -60,17 +61,20 @@ def _fmt_price(p) -> str:
 
 def signal_text(sig: Signal) -> str:
     side = (sig.signal or "").upper()
-    icon = "🟢" if side in ("BUY", "LONG") else "🔴" if side in ("SELL", "SHORT") else "⚪"
+    icon = "🟢" if side in ("BUY", "LONG") else "🔴" if side in ("SELL", "SHORT") else "ℹ️"
     t = sig.received_at.strftime("%Y-%m-%d %H:%M:%S UTC") if sig.received_at else "-"
     lines = [
-        f"{icon} <b>{side or '?'}</b> {sig.instrument or '?'}",
-        f"Indikator: {sig.indicator or '-'}",
+        f"{icon} <b>{side or '?'}</b> {html.escape(sig.instrument or '?')}",
+        f"Indikator: {html.escape(sig.indicator or '-')}",
         f"Pris: {_fmt_price(sig.price)}",
         f"Timeframe: {sig.timeframe or '-'}",
         f"Tid: {t}",
         f"Signal #{sig.id}",
     ]
-    if sig.status != "NEW":
+    msg = (sig.raw or {}).get("message") if isinstance(sig.raw, dict) else None
+    if msg:
+        lines.insert(2, f"Melding: {html.escape(msg[:500])}")
+    if sig.status not in ("NEW", "INFO"):
         d = sig.decided_at.strftime("%H:%M:%S UTC") if sig.decided_at else ""
         mark = "✅ GODKJENT" if sig.status == "APPROVED" else "❌ AVVIST"
         lines.append(f"\n<b>{mark}</b> {d}")
@@ -96,8 +100,9 @@ async def notify_signal(sig_id: int) -> None:
         sig = s.get(Signal, sig_id)
         if not sig:
             return
+        extra = {} if sig.status == "INFO" else {"reply_markup": _keyboard(sig.id)}
         res = await call("sendMessage", chat_id=chat, text=signal_text(sig),
-                         parse_mode="HTML", reply_markup=_keyboard(sig.id))
+                         parse_mode="HTML", **extra)
         if res.get("ok"):
             sig.telegram_message_id = res["result"]["message_id"]
             s.commit()

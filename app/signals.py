@@ -7,6 +7,22 @@ from app.db import SessionLocal
 from app.models import Signal
 
 
+import re
+
+_BUY = re.compile(r"\b(buy|long|bull|bullish)\b", re.I)
+_SELL = re.compile(r"\b(sell|short|bear|bearish)\b", re.I)
+
+
+def parse_side(text: str) -> str:
+    """Finn retning i en tekstmelding. INFO hvis ingen/begge retninger nevnes."""
+    b, s = bool(_BUY.search(text)), bool(_SELL.search(text))
+    if b and not s:
+        return "BUY"
+    if s and not b:
+        return "SELL"
+    return "INFO"
+
+
 def _first(data: dict, *keys):
     for k in keys:
         if data.get(k) not in (None, ""):
@@ -31,6 +47,7 @@ def save_signal(data: dict, source_ip: str | None) -> Signal:
         timeframe=_first(data, "timeframe", "interval"),
         bar_time=_first(data, "time", "bar_time"),
         source_ip=source_ip,
+        status="INFO" if str(_first(data, "signal", "action", "side") or "").upper() == "INFO" else "NEW",
         raw=clean,
     )
     with SessionLocal() as s:

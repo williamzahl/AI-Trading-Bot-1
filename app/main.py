@@ -9,7 +9,7 @@ from sqlalchemy import text
 
 from app import config, telegram_bot
 from app.db import engine, init_db
-from app.signals import latest_signals, save_signal
+from app.signals import latest_signals, parse_side, save_signal
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("smt-bot")
@@ -38,6 +38,9 @@ def client_ip(request: Request) -> str | None:
 
 
 def check_secret(value: str | None) -> None:
+    # "+" i en URL blir til mellomrom; Render-noekler kan inneholde "+".
+    if value:
+        value = str(value).replace(" ", "+")
     if not config.WEBHOOK_SECRET or not value or not secrets.compare_digest(
         str(value), config.WEBHOOK_SECRET
     ):
@@ -64,15 +67,23 @@ async def tradingview_webhook(request: Request, background: BackgroundTasks):
         raise HTTPException(status_code=403, detail="IP ikke tillatt")
 
     body = await request.body()
+    params = request.query_params
     try:
         data = json.loads(body)
         if not isinstance(data, dict):
             raise ValueError
     except ValueError:
-        log.warning("Ugyldig JSON fra %s: %r", ip, body[:200])
-        raise HTTPException(status_code=400, detail="Meldingen maa vaere gyldig JSON")
+        # Ren tekst, f.eks. fra eksisterende alert()-kall i egne indikatorer.
+        # Da maa noekkelen ligge i URL-en: ...?key=SECRET&indicator=SMT-5M
+        text_msg = body.decode("utf-8", errors="replace").strip()
+        data = {"message": text_msg, "signal": parse_side(text_msg), "format": "text"}
 
-    check_secret(data.get("secret"))
+    # URL-parametre fyller inn det meldingen mangler (indicator, instrument, ...)
+    for k in ("indicator", "instrument", "timeframe", "signal"):
+        if params.get(k) and not data.get(k):
+            data[k] = params[k]
+
+    check_secret(data.get("secret") or params.get("key"))
     sig = save_signal(data, ip)
     background.add_task(telegram_bot.notify_signal, sig.id)
     log.info("SIGNAL #%s %s %s %s @ %s", sig.id, sig.instrument, sig.indicator, sig.signal, sig.price)
