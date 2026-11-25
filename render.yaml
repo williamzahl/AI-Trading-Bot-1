@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: smt-bot
+    name: smt-webhook
     runtime: python
     region: oregon
     plan: 0.5c-512mb
