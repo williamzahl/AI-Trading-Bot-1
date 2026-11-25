@@ -23,8 +23,10 @@ class Signal(Base):
     timeframe: Mapped[str | None] = mapped_column(String(16))
     bar_time: Mapped[str | None] = mapped_column(String(64))
     source_ip: Mapped[str | None] = mapped_column(String(64))
-    # Status brukes senere av Telegram-godkjenning: NEW -> APPROVED / REJECTED
+    # NEW -> APPROVED / REJECTED (settes fra Telegram)
     status: Mapped[str] = mapped_column(String(16), default="NEW", index=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    telegram_message_id: Mapped[int | None] = mapped_column(Integer)
     raw: Mapped[dict] = mapped_column(JSON)
 
     def to_dict(self) -> dict:
@@ -38,5 +40,14 @@ class Signal(Base):
             "timeframe": self.timeframe,
             "bar_time": self.bar_time,
             "status": self.status,
+            "decided_at": self.decided_at.isoformat() if self.decided_at else None,
             "source_ip": self.source_ip,
         }
+
+
+class Setting(Base):
+    """Enkle noekkel/verdi-innstillinger, f.eks. hvilken Telegram-chat som eier boten."""
+    __tablename__ = "settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(String(512))

@@ -4,10 +4,10 @@ import logging
 import secrets
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
 from sqlalchemy import text
 
-from app import config
+from app import config, telegram_bot
 from app.db import engine, init_db
 from app.signals import latest_signals, save_signal
 
@@ -19,6 +19,10 @@ log = logging.getLogger("smt-bot")
 async def lifespan(_: FastAPI):
     init_db()
     log.info("Database klar. IP-allowlist=%s", config.TV_IP_ALLOWLIST)
+    try:
+        await telegram_bot.setup_webhook()
+    except Exception:  # Telegram-feil skal aldri stoppe mottakeren
+        log.exception("Kunne ikke sette opp Telegram")
     yield
 
 
@@ -53,7 +57,7 @@ def health():
 
 
 @app.post("/webhook/tradingview")
-async def tradingview_webhook(request: Request):
+async def tradingview_webhook(request: Request, background: BackgroundTasks):
     ip = client_ip(request)
     if config.TV_IP_ALLOWLIST and ip not in config.TRADINGVIEW_IPS:
         log.warning("Avvist IP %s", ip)
@@ -70,6 +74,7 @@ async def tradingview_webhook(request: Request):
 
     check_secret(data.get("secret"))
     sig = save_signal(data, ip)
+    background.add_task(telegram_bot.notify_signal, sig.id)
     log.info("SIGNAL #%s %s %s %s @ %s", sig.id, sig.instrument, sig.indicator, sig.signal, sig.price)
     return {"ok": True, "id": sig.id}
 
@@ -78,3 +83,20 @@ async def tradingview_webhook(request: Request):
 def signals(key: str = Query(...), limit: int = Query(20, ge=1, le=200)):
     check_secret(key)
     return latest_signals(limit)
+
+
+@app.post(telegram_bot.WEBHOOK_PATH)
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None),
+):
+    if not telegram_bot.enabled() or not x_telegram_bot_api_secret_token or not secrets.compare_digest(
+        x_telegram_bot_api_secret_token, telegram_bot.webhook_secret()
+    ):
+        raise HTTPException(status_code=401)
+    update = await request.json()
+    try:
+        await telegram_bot.handle_update(update)
+    except Exception:
+        log.exception("Feil ved behandling av Telegram-oppdatering")
+    return {"ok": True}
