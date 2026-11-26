@@ -33,6 +33,10 @@ def _num(name: str, default: float) -> float:
 
 # Noedstopp: ingen ordre sendes uten EXECUTION_ENABLED=on
 EXECUTION_ENABLED = os.getenv("EXECUTION_ENABLED", "off").strip().lower() in ("on", "true", "1")
+# "metaapi" = Render sender ordren via MetaApi.cloud
+# "ea"      = en EA i MT5 (f.eks. paa MetaQuotes VPS) henter ordren fra Render
+EXECUTION_MODE = os.getenv("EXECUTION_MODE", "metaapi").strip().lower()
+MT5_EA_KEY = os.getenv("MT5_EA_KEY", "").strip()  # egen noekkel for EA-en
 METAAPI_TOKEN = os.getenv("METAAPI_TOKEN", "").strip()
 METAAPI_ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "").strip()
 METAAPI_REGION = os.getenv("METAAPI_REGION", "").strip()  # tom = finn automatisk

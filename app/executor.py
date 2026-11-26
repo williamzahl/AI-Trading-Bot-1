@@ -40,7 +40,13 @@ def set_paused(value: bool) -> None:
     set_setting(KILL_KEY, "1" if value else "0")
 
 
+def ea_mode() -> bool:
+    return config.EXECUTION_MODE == "ea"
+
+
 def configured() -> bool:
+    if ea_mode():
+        return bool(config.MT5_EA_KEY)
     return bool(config.METAAPI_TOKEN and config.METAAPI_ACCOUNT_ID)
 
 
@@ -49,6 +55,8 @@ def state() -> tuple[bool, str]:
     if not config.EXECUTION_ENABLED:
         return False, "AV (EXECUTION_ENABLED er ikke 'on' i Render)"
     if not configured():
+        if ea_mode():
+            return False, "AV (MT5_EA_KEY mangler i Render)"
         return False, "AV (METAAPI_TOKEN eller METAAPI_ACCOUNT_ID mangler)"
     if paused():
         return False, "PAUSET (/stopp i Telegram). Skriv /handel_paa for aa starte igjen"
@@ -139,7 +147,7 @@ async def execute_signal(sig_id: int) -> str:
         sig = s.get(Signal, sig_id)
         if not sig:
             return "Fant ikke signalet."
-        if sig.exec_status in ("SENDING", "FILLED"):
+        if sig.exec_status in ("SENDING", "QUEUED", "FILLED"):
             return f"Ordre for #{sig.id} er allerede {sig.exec_status}."
         sig.exec_status = "SENDING"
         s.commit()
@@ -160,6 +168,12 @@ async def execute_signal(sig_id: int) -> str:
             age_min = (datetime.now(timezone.utc) - received).total_seconds() / 60
             if age_min > config.MAX_SIGNAL_AGE_MIN:
                 raise ExecError(f"Signalet er {age_min:.0f} min gammelt (maks {config.MAX_SIGNAL_AGE_MIN}). Ingen ordre.")
+
+            if ea_mode():
+                # EA-en i MT5 henter ordren selv og sjekker aapne posisjoner der.
+                status = "QUEUED"
+                raise ExecError(f"📨 Ordre #{sig.id} {sig.signal} {symbol} lagt i koe. "
+                                "Venter paa at MT5 (EA) henter den...")
 
             positions = await open_positions()
             if len(positions) >= config.MAX_OPEN_POSITIONS:
@@ -184,7 +198,8 @@ async def execute_signal(sig_id: int) -> str:
             else:
                 text = f"⚠️ MT5 avviste ordre #{sig.id}: {code} {res.get('message', '')}"
         except ExecError as e:
-            text = ("⛔ " if status == "SKIPPED" else "⚠️ ") + str(e)
+            prefix = {"SKIPPED": "⛔ ", "QUEUED": ""}.get(status, "⚠️ ")
+            text = prefix + str(e)
         except Exception as e:  # nettverk o.l.
             log.exception("Ordre for signal #%s feilet", sig_id)
             status, text = "FAILED", f"⚠️ Teknisk feil ved ordre #{sig_id}: {type(e).__name__}: {e}"[:400]
