@@ -20,6 +20,12 @@ services:
         value: "on"
       - key: TELEGRAM_BOT_TOKEN
         sync: false
+      # Ordre til MT5 via MetaApi.cloud. Ingenting sendes foer EXECUTION_ENABLED=on
+      # settes i Render. Standardverdier (lot, SL/TP osv.) ligger i app/config.py.
+      - key: METAAPI_TOKEN
+        sync: false
+      - key: METAAPI_ACCOUNT_ID
+        sync: false
 
 databases:
   - name: smt-db

@@ -28,6 +28,11 @@ class Signal(Base):
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     telegram_message_id: Mapped[int | None] = mapped_column(Integer)
     raw: Mapped[dict] = mapped_column(JSON)
+    # Ordre til MT5: SENDING / FILLED / FAILED / SKIPPED
+    exec_status: Mapped[str | None] = mapped_column(String(16))
+    exec_message: Mapped[str | None] = mapped_column(String(512))
+    exec_order_id: Mapped[str | None] = mapped_column(String(64))
+    exec_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     def to_dict(self) -> dict:
         return {
@@ -42,6 +47,9 @@ class Signal(Base):
             "status": self.status,
             "decided_at": self.decided_at.isoformat() if self.decided_at else None,
             "source_ip": self.source_ip,
+            "exec_status": self.exec_status,
+            "exec_message": self.exec_message,
+            "exec_order_id": self.exec_order_id,
         }
 
 
