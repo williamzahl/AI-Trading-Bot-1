@@ -165,7 +165,16 @@ async def _handle_message(msg: dict) -> None:
         lines = [f"Handel: {why}",
                  f"Lot: {config.TRADE_LOT} | SL {config.STOP_LOSS_PCT}% | TP {config.TAKE_PROFIT_PCT}%",
                  f"Maks aapne posisjoner: {config.MAX_OPEN_POSITIONS} | Symboler: {', '.join(config.ALLOWED_SYMBOLS)}"]
-        if executor.configured():
+        if executor.ea_mode():
+            from app import ea_bridge
+            seen = ea_bridge.last_seen_seconds()
+            acc = get_setting("ea_account") or "?"
+            if seen is None:
+                lines.append("MT5-EA: har aldri kontaktet Render")
+            else:
+                mark = "🟢" if seen < 60 else "🔴"
+                lines.append(f"MT5-EA {mark} sist sett for {seen:.0f} sek siden (konto {acc})")
+        elif executor.configured():
             try:
                 acc = await executor.account_info()
                 pos = await executor.open_positions()

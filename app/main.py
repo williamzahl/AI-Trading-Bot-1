@@ -5,9 +5,10 @@ import secrets
 from contextlib import asynccontextmanager
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import PlainTextResponse
 from sqlalchemy import text
 
-from app import config, executor, telegram_bot
+from app import config, ea_bridge, executor, telegram_bot
 from app.db import engine, init_db
 from app.signals import latest_signals, parse_text, save_signal
 
@@ -152,3 +153,25 @@ async def metaapi_status(key: str = Query(...)):
         return await executor.diagnose()
     except Exception as e:
         return {"feil": f"{type(e).__name__}: {e}"[:500]}
+
+
+def check_ea_key(value: str | None) -> None:
+    if not config.MT5_EA_KEY or not value or not secrets.compare_digest(str(value), config.MT5_EA_KEY):
+        raise HTTPException(status_code=401, detail="Feil EA-noekkel")
+
+
+@app.get("/mt5/next", response_class=PlainTextResponse)
+async def mt5_next(key: str = Query(...), account: str = Query("")):
+    """EA-en i MT5 henter neste godkjente ordre her."""
+    check_ea_key(key)
+    return await ea_bridge.next_order(account)
+
+
+@app.post("/mt5/result", response_class=PlainTextResponse)
+async def mt5_result(key: str = Query(...), id: int = Query(...), ok: int = Query(0),
+                     ticket: str = Query(""), price: str = Query(""), sl: str = Query(""),
+                     tp: str = Query(""), msg: str = Query("")):
+    """EA-en melder resultatet av en ordre her."""
+    check_ea_key(key)
+    await ea_bridge.record_result(id, bool(ok), ticket, price, sl, tp, msg[:300])
+    return "OK"

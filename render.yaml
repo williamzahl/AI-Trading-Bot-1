@@ -26,6 +26,8 @@ services:
         sync: false
       - key: METAAPI_ACCOUNT_ID
         sync: false
+      - key: MT5_EA_KEY
+        sync: false
 
 databases:
   - name: smt-db

@@ -33,6 +33,19 @@ MetaApi.cloud, og resultatet kommer som svar i Telegram. Alt kjoerer i skyen.
 
 Telegram: `/status` (konto og posisjoner), `/stopp` (pause), `/handel_paa`.
 
+## Alternativ: EA paa MetaQuotes VPS (`EXECUTION_MODE=ea`)
+I stedet for MetaApi kan MT5 selv hente ordrene. EA-en `mt5/SMT_Render_Bridge.mq5`
+spoer `GET /mt5/next?key=<MT5_EA_KEY>` hvert 3. sekund, utfoerer ordren med SL/TP og
+melder svaret til `POST /mt5/result`. Svaret kommer i Telegram. Kjoer MT5 med EA-en paa
+MetaQuotes VPS (Navigator > VPS), saa trengs ikke PC-en.
+
+| Miljoevariabel | Betydning |
+|---|---|
+| `EXECUTION_MODE` | `metaapi` (standard) eller `ea` |
+| `MT5_EA_KEY` | Egen hemmelig noekkel som limes inn i EA-en |
+
+`/status` i Telegram viser naar EA-en sist kontaktet Render.
+
 ## JSON-format fra TradingView
 ```json
 {
@@ -51,6 +64,7 @@ Telegram: `/status` (konto og posisjoner), `/stopp` (pause), `/handel_paa`.
 - `app/signals.py` - signalbehandling og lagring
 - `app/telegram_bot.py` - Telegram-varsler og APPROVE/REJECT
 - `app/executor.py` - sender godkjente signaler som ordre til MT5 via MetaApi
+- `app/ea_bridge.py` + `mt5/SMT_Render_Bridge.mq5` - alternativ: EA i MT5 henter ordrene
 - `app/models.py` - databasetabeller
 - `app/db.py`, `app/config.py` - oppsett
 - `render.yaml` - oppretter web-tjeneste og database paa Render
