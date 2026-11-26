@@ -195,3 +195,30 @@ async def execute_signal(sig_id: int) -> str:
         s.commit()
         log.info("Ordre #%s: %s %s", sig_id, status, text.replace("\n", " | "))
         return text
+
+
+async def diagnose() -> dict:
+    """Feilsoeking: hva MetaApi selv sier om kontoen (uten passord/token)."""
+    out: dict = {"token_satt": bool(config.METAAPI_TOKEN), "konto_id": config.METAAPI_ACCOUNT_ID or None,
+                 "handel": state()[1]}
+    if not configured():
+        return out
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(f"{PROVISIONING}/users/current/accounts/{config.METAAPI_ACCOUNT_ID}",
+                             headers=_headers())
+        if r.status_code != 200:
+            out["metaapi_konto"] = {"http": r.status_code, "svar": r.text[:500]}
+            return out
+        acc = r.json()
+        keep = ("name", "login", "server", "platform", "type", "region", "reliability", "state",
+                "connectionStatus", "provisioningProfileId", "magic", "resourceSlots", "accessRights")
+        out["metaapi_konto"] = {k: acc.get(k) for k in keep if k in acc}
+        region = acc.get("region") or "new-york"
+        url = f"{CLIENT.format(region=region)}/users/current/accounts/{config.METAAPI_ACCOUNT_ID}/account-information"
+        r2 = await client.get(url, headers=_headers())
+        try:
+            body = r2.json()
+        except ValueError:
+            body = r2.text[:500]
+        out["mt5_tilkobling"] = {"http": r2.status_code, "svar": body}
+    return out

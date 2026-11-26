@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request
 from sqlalchemy import text
 
-from app import config, telegram_bot
+from app import config, executor, telegram_bot
 from app.db import engine, init_db
 from app.signals import latest_signals, parse_text, save_signal
 
@@ -142,3 +142,13 @@ async def telegram_reset(key: str = Query(...)):
     check_secret(key)
     await telegram_bot.setup_webhook()
     return await telegram_status(key)
+
+
+@app.get("/metaapi/status")
+async def metaapi_status(key: str = Query(...)):
+    """Feilsoeking: viser hva MetaApi sier om MT5-kontoen og hvorfor den evt. ikke er tilkoblet."""
+    check_secret(key)
+    try:
+        return await executor.diagnose()
+    except Exception as e:
+        return {"feil": f"{type(e).__name__}: {e}"[:500]}
