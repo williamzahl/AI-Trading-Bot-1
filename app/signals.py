@@ -57,6 +57,26 @@ def _to_float(value):
         return None
 
 
+def normalize(data: dict) -> dict:
+    """Fyll inn trend-felt som noen indikatorversjoner sender under andre navn.
+
+    Uten `trend_aligned` ville et signal mot trenden faatt APPROVE/REJECT-knapper,
+    saa den regnes ut fra `bias` og retningen naar den mangler.
+    """
+    if "change_24h_pct" not in data and "bias_24h_pct" in data:
+        data["change_24h_pct"] = _to_float(data["bias_24h_pct"])
+    elif "change_24h_pct" in data:
+        data["change_24h_pct"] = _to_float(data["change_24h_pct"])
+    bias = str(data.get("bias") or "").upper()
+    if bias and "trend_aligned" not in data:
+        side = str(_first(data, "signal", "action", "side") or "").upper()
+        data["bias"] = bias
+        data["trend_aligned"] = (side == "BUY" and bias == "UP") or (side == "SELL" and bias == "DOWN")
+    elif isinstance(data.get("trend_aligned"), str):
+        data["trend_aligned"] = data["trend_aligned"].strip().lower() in ("true", "1", "yes")
+    return data
+
+
 def _initial_status(data: dict) -> str:
     """NEW = faar APPROVE/REJECT-knapper. INFO = bare informasjon."""
     if str(_first(data, "signal", "action", "side") or "").upper() == "INFO":
@@ -67,6 +87,7 @@ def _initial_status(data: dict) -> str:
 
 
 def save_signal(data: dict, source_ip: str | None) -> Signal:
+    data = normalize(data)
     clean = {k: v for k, v in data.items() if k != "secret"}  # lagre aldri noekkelen
     sig = Signal(
         instrument=_first(data, "instrument", "ticker", "symbol"),
