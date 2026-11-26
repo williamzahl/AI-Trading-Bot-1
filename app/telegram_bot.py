@@ -1,4 +1,5 @@
 """Telegram: sender signaler med APPROVE/REJECT-knapper og tar imot svarene."""
+import asyncio
 import hashlib
 import html
 import logging
@@ -6,11 +7,12 @@ from datetime import datetime, timezone
 
 import httpx
 
-from app import config
+from app import config, executor
 from app.db import SessionLocal, get_setting, set_setting
 from app.models import Signal
 
 log = logging.getLogger("smt-bot")
+_tasks: set = set()  # holder bakgrunnsjobber i live
 
 API = "https://api.telegram.org/bot{token}/{method}"
 WEBHOOK_PATH = "/telegram/webhook"
@@ -136,13 +138,46 @@ async def _handle_message(msg: dict) -> None:
                             "Nye TradingView-signaler kommer hit med APPROVE/REJECT.")
             log.info("Telegram-eier registrert: %s", chat_id)
         elif owner == chat_id:
-            await call("sendMessage", chat_id=chat_id, text="Boten er aktiv. Du er eier. Skriv /siste for de siste signalene.")
+            await call("sendMessage", chat_id=chat_id, text="Boten er aktiv. Du er eier.\n/siste - siste signaler\n/status - handel og MT5-konto\n/stopp - noedstopp\n/handel_paa - start handel igjen")
         else:
             log.warning("Ukjent chat %s proevde /start", chat_id)
             await call("sendMessage", chat_id=chat_id, text="Ingen tilgang.")
         return
 
     if owner != chat_id:
+        return
+
+    if text.startswith("/stopp"):
+        executor.set_paused(True)
+        await call("sendMessage", chat_id=chat_id,
+                   text="⛔ Handel PAUSET. Ingen nye ordre sendes. Aapne posisjoner beholder sin SL/TP.\n"
+                        "Skriv /handel_paa for aa starte igjen.")
+        return
+
+    if text.startswith("/handel_paa"):
+        executor.set_paused(False)
+        ok, why = executor.state()
+        await call("sendMessage", chat_id=chat_id, text=f"Handel: {why}")
+        return
+
+    if text.startswith("/status"):
+        ok, why = executor.state()
+        lines = [f"Handel: {why}",
+                 f"Lot: {config.TRADE_LOT} | SL {config.STOP_LOSS_PCT}% | TP {config.TAKE_PROFIT_PCT}%",
+                 f"Maks aapne posisjoner: {config.MAX_OPEN_POSITIONS} | Symboler: {', '.join(config.ALLOWED_SYMBOLS)}"]
+        if executor.configured():
+            try:
+                acc = await executor.account_info()
+                pos = await executor.open_positions()
+                lines.append(f"MT5: {acc.get('login') or acc.get('name', '')} {acc.get('type', '')}")
+                lines.append(f"Balanse {acc.get('balance')} {acc.get('currency', '')} | Equity {acc.get('equity')}")
+                lines.append(f"Aapne posisjoner: {len(pos)}")
+                for p in pos[:5]:
+                    lines.append(f"  {p.get('type', '')[14:]} {p.get('volume')} {p.get('symbol')} "
+                                 f"@ {p.get('openPrice')} P/L {p.get('profit')}")
+            except Exception as e:
+                lines.append(f"⚠️ Fikk ikke kontakt med MetaApi: {e}"[:300])
+        await call("sendMessage", chat_id=chat_id, text="\n".join(lines))
         return
 
     if text.startswith("/siste"):
@@ -185,3 +220,18 @@ async def _handle_callback(cq: dict) -> None:
                    text="Godkjent ✅" if sig.status == "APPROVED" else "Avvist ❌")
         await call("editMessageText", chat_id=chat_id, message_id=cq["message"]["message_id"],
                    text=signal_text(sig), parse_mode="HTML")
+        approved = sig.status == "APPROVED"
+
+    if approved:
+        task = asyncio.create_task(_execute_and_report(sig_id, chat_id, cq["message"]["message_id"]))
+        _tasks.add(task)
+        task.add_done_callback(_tasks.discard)
+
+
+async def _execute_and_report(sig_id: int, chat_id: str, reply_to: int) -> None:
+    try:
+        text = await executor.execute_signal(sig_id)
+    except Exception as e:
+        log.exception("Ordre for #%s krasjet", sig_id)
+        text = f"⚠️ Ordre for #{sig_id} feilet: {e}"[:400]
+    await call("sendMessage", chat_id=chat_id, text=text, reply_to_message_id=reply_to)
