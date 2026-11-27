@@ -175,3 +175,12 @@ async def mt5_result(key: str = Query(...), id: int = Query(...), ok: int = Quer
     check_ea_key(key)
     await ea_bridge.record_result(id, bool(ok), ticket, price, sl, tp, msg[:300])
     return "OK"
+
+
+@app.post("/mt5/closed", response_class=PlainTextResponse)
+async def mt5_closed(key: str = Query(...), id: int = Query(...), price: str = Query(""),
+                     profit: str = Query(""), reason: str = Query("")):
+    """EA-en melder at en trade er lukket (TP/SL/manuelt)."""
+    check_ea_key(key)
+    await ea_bridge.record_close(id, price, profit, reason)
+    return "OK"

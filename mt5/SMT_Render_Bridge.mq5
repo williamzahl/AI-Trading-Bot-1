@@ -8,7 +8,7 @@
 //|   - legg til https://smt-webhook-4dgq.onrender.com               |
 //+------------------------------------------------------------------+
 #property copyright "SMT Bot"
-#property version   "1.00"
+#property version   "1.10"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -134,6 +134,57 @@ double NormalizeLot(const string symbol, double lot)
    if(lot < minLot) lot = minLot;
    if(lot > maxLot) lot = maxLot;
    return(lot);
+  }
+
+// Meld til Render naar en SMT-trade lukkes (TP, SL eller manuelt)
+void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request,
+                        const MqlTradeResult &result)
+  {
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD || trans.deal == 0) return;
+   if(!HistoryDealSelect(trans.deal)) return;
+   long entry = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY) return;
+
+   long   posId  = HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+   double price  = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
+   double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT) +
+                   HistoryDealGetDouble(trans.deal, DEAL_SWAP) +
+                   HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
+   long   reasonCode = HistoryDealGetInteger(trans.deal, DEAL_REASON);
+   string symbol = HistoryDealGetString(trans.deal, DEAL_SYMBOL);
+   int    digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+
+   // Finn aapningshandelen for aa faa signal-ID fra kommentaren "SMT #123"
+   if(!HistorySelectByPosition(posId)) return;
+   string id = "";
+   for(int i = 0; i < HistoryDealsTotal(); i++)
+     {
+      ulong d = HistoryDealGetTicket(i);
+      if(HistoryDealGetInteger(d, DEAL_ENTRY) != DEAL_ENTRY_IN) continue;
+      if(HistoryDealGetInteger(d, DEAL_MAGIC) != InpMagic) return;
+      string c = HistoryDealGetString(d, DEAL_COMMENT);
+      if(StringFind(c, "SMT #") == 0) id = StringSubstr(c, 5);
+      // Lukk-handelens kommisjon ligger ofte paa aapningshandelen
+      profit += HistoryDealGetDouble(d, DEAL_COMMISSION);
+     }
+   if(StringLen(id) == 0) return;
+
+   string reason = "OTHER";
+   if(reasonCode == DEAL_REASON_TP) reason = "TP";
+   else if(reasonCode == DEAL_REASON_SL) reason = "SL";
+   else if(reasonCode == DEAL_REASON_SO) reason = "SO";
+   else if(reasonCode == DEAL_REASON_EXPERT) reason = "EA";
+   else if(reasonCode == DEAL_REASON_CLIENT || reasonCode == DEAL_REASON_MOBILE || reasonCode == DEAL_REASON_WEB) reason = "MANUAL";
+
+   string url = InpBaseUrl + "/mt5/closed?key=" + UrlEncode(InpKey) + "&id=" + id +
+                "&price=" + DoubleToString(price, digits) +
+                "&profit=" + DoubleToString(profit, 2) + "&reason=" + reason;
+   string body;
+   for(int attempt = 0; attempt < 3; attempt++)
+     {
+      if(Http("POST", url, body)) { Print("SMT: meldte lukking av #", id, " (", reason, " ", profit, ")"); return; }
+      Sleep(1000);
+     }
   }
 
 //+------------------------------------------------------------------+

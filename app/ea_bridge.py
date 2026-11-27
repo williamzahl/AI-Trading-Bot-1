@@ -72,21 +72,67 @@ async def next_order(account: str = "") -> str:
     return "NONE"
 
 
+def _f(v: str) -> float | None:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 async def record_result(sig_id: int, ok: bool, ticket: str, price: str, sl: str, tp: str, msg: str) -> None:
     with SessionLocal() as s:
         sig = s.get(Signal, sig_id)
         if not sig:
             return
+        symbol = executor.mt5_symbol(sig.instrument) or sig.instrument
         if ok:
             sig.exec_status = "FILLED"
             sig.exec_order_id = ticket[:64] or None
-            text = (f"✅ ORDRE UTFOERT #{sig.id}: {sig.signal} {config.TRADE_LOT} "
-                    f"{executor.mt5_symbol(sig.instrument)} @ {price}\nSL {sl} / TP {tp}\nTicket: {ticket or '-'}")
+            sig.exec_price, sig.exec_sl, sig.exec_tp = _f(price), _f(sl), _f(tp)
+            icon = "🟢" if (sig.signal or "").upper() == "BUY" else "🔴"
+            text = (f"✅ TRADE TATT #{sig.id}\n"
+                    f"{icon} {sig.signal} {config.TRADE_LOT} lot {symbol}\n"
+                    f"Entry: {price}\nSL: {sl}\nTP: {tp}\n"
+                    f"Ticket: {ticket or '-'}")
         else:
-            sig.exec_status = "FAILED" if not msg.startswith("SKIP") else "SKIPPED"
-            text = f"⚠️ MT5 utfoerte ikke ordre #{sig.id}: {msg}"
+            sig.exec_status = "SKIPPED" if msg.startswith("SKIP") else "FAILED"
+            reason = msg[5:].strip() if msg.startswith("SKIP") else msg
+            head = "⏭ INGEN TRADE" if sig.exec_status == "SKIPPED" else "⚠️ TRADE FEILET"
+            text = f"{head} #{sig.id} ({sig.signal} {symbol})\nGrunn: {reason}"
         sig.exec_message = text[:500]
         sig.exec_at = datetime.now(timezone.utc)
         s.commit()
         log.info("EA-resultat #%s: %s", sig_id, text.replace("\n", " | "))
+        await _tell(sig, text)
+
+
+REASONS = {"TP": "Take profit 🎯", "SL": "Stop loss 🛑", "MANUAL": "Lukket manuelt",
+           "EA": "Lukket av EA", "SO": "Stop out (margin)", "OTHER": "Lukket"}
+
+
+async def record_close(sig_id: int, price: str, profit: str, reason: str) -> None:
+    with SessionLocal() as s:
+        sig = s.get(Signal, sig_id)
+        if not sig:
+            return
+        if sig.closed_at:  # allerede meldt
+            return
+        sig.close_price, sig.close_profit = _f(price), _f(profit)
+        sig.close_reason = reason[:32]
+        sig.closed_at = datetime.now(timezone.utc)
+        s.commit()
+        symbol = executor.mt5_symbol(sig.instrument) or sig.instrument
+        p = sig.close_profit
+        icon = "💰" if p is not None and p > 0 else "📉" if p is not None and p < 0 else "➖"
+        opened = sig.exec_at or sig.received_at
+        mins = (sig.closed_at - _aware(opened)).total_seconds() / 60 if opened else None
+        lines = [f"{icon} TRADE LUKKET #{sig.id}",
+                 f"{sig.signal} {config.TRADE_LOT} lot {symbol}",
+                 f"Entry: {sig.exec_price if sig.exec_price is not None else '-'} -> Exit: {price}",
+                 f"Resultat: {p:+.2f} USD" if p is not None else "Resultat: -",
+                 f"Grunn: {REASONS.get(reason.upper(), reason)}"]
+        if mins is not None:
+            lines.append(f"Varighet: {mins:.0f} min")
+        text = "\n".join(lines)
+        log.info("Lukket #%s: %s", sig_id, text.replace("\n", " | "))
         await _tell(sig, text)

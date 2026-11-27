@@ -33,6 +33,14 @@ class Signal(Base):
     exec_message: Mapped[str | None] = mapped_column(String(512))
     exec_order_id: Mapped[str | None] = mapped_column(String(64))
     exec_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    exec_price: Mapped[float | None] = mapped_column(Float)
+    exec_sl: Mapped[float | None] = mapped_column(Float)
+    exec_tp: Mapped[float | None] = mapped_column(Float)
+    # Etter at traden er lukket (meldt av EA-en)
+    close_price: Mapped[float | None] = mapped_column(Float)
+    close_profit: Mapped[float | None] = mapped_column(Float)
+    close_reason: Mapped[str | None] = mapped_column(String(32))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     def to_dict(self) -> dict:
         return {
@@ -50,6 +58,13 @@ class Signal(Base):
             "exec_status": self.exec_status,
             "exec_message": self.exec_message,
             "exec_order_id": self.exec_order_id,
+            "exec_price": self.exec_price,
+            "exec_sl": self.exec_sl,
+            "exec_tp": self.exec_tp,
+            "close_price": self.close_price,
+            "close_profit": self.close_profit,
+            "close_reason": self.close_reason,
+            "closed_at": self.closed_at.isoformat() if self.closed_at else None,
         }
 
 
