@@ -5,6 +5,7 @@ faar den en enkel tekstlinje tilbake, utfoerer ordren i MT5 og melder
 resultatet med POST /mt5/result. Resultatet sendes videre til Telegram.
 """
 import logging
+import re
 from datetime import datetime, timezone
 
 from app import config, executor, telegram_bot
@@ -50,7 +51,7 @@ async def next_order(account: str = "") -> str:
             age_min = (now - _aware(sig.received_at)).total_seconds() / 60
             if age_min > config.MAX_SIGNAL_AGE_MIN:
                 sig.exec_status = "SKIPPED"
-                sig.exec_message = f"⛔ Ordre #{sig.id} utloept ({age_min:.0f} min gammel) foer MT5 hentet den."
+                sig.exec_message = f"⛔ Ordre #{sig.id} utløpt ({age_min:.0f} min gammel) før MT5 hentet den."
                 sig.exec_at = now
                 s.commit()
                 await _tell(sig, sig.exec_message)
@@ -75,6 +76,14 @@ async def next_order(account: str = "") -> str:
     return "NONE"
 
 
+_NO = {"aapne": "åpne", "slaatt": "slått", "utfoert": "utført", "maa": "må", "paa": "på"}
+
+
+def _norsk(text: str) -> str:
+    """EA-en sender ren ASCII; bytt til æ/ø/å foer det vises i Telegram."""
+    return re.sub(r"\b(" + "|".join(_NO) + r")\b", lambda m: _NO[m.group(1)], text)
+
+
 def _f(v: str) -> float | None:
     try:
         return float(v)
@@ -96,7 +105,7 @@ async def record_result(sig_id: int, ok: bool, ticket: str, price: str, sl: str,
             icon = "🟢" if (sig.signal or "").upper() == "BUY" else "🔴"
             sig.exec_lot = _f(lot) or config.TRADE_LOT
             r = _f(risk)
-            risk_line = (f"Risiko: {r:.0f} $  ->  Maal: {r * config.RISK_REWARD:.0f} $ "
+            risk_line = (f"Risiko: {r:.0f} $  ->  Mål: {r * config.RISK_REWARD:.0f} $ "
                          f"(1:{config.RISK_REWARD:g})\n") if r else ""
             text = (f"✅ TRADE TATT #{sig.id}\n"
                     f"{icon} {sig.signal} {sig.exec_lot:g} lot {symbol}\n"
@@ -104,7 +113,7 @@ async def record_result(sig_id: int, ok: bool, ticket: str, price: str, sl: str,
                     f"Ticket: {ticket or '-'}")
         else:
             sig.exec_status = "SKIPPED" if msg.startswith("SKIP") else "FAILED"
-            reason = msg[5:].strip() if msg.startswith("SKIP") else msg
+            reason = _norsk(msg[5:].strip() if msg.startswith("SKIP") else msg)
             head = "⏭ INGEN TRADE" if sig.exec_status == "SKIPPED" else "⚠️ TRADE FEILET"
             text = f"{head} #{sig.id} ({sig.signal} {symbol})\nGrunn: {reason}"
         sig.exec_message = text[:500]
