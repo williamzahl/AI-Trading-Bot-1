@@ -196,7 +196,7 @@ async def _handle_message(msg: dict) -> None:
         ok, why = executor.state()
         handel = "PÅ ✅" if ok else f"⛔ {why}"
         modus = "🤖 Automatisk" if config.AUTO_TRADE else "✋ Manuell (APPROVE)"
-        lines = [f"Handel: {handel}", f"Modus: {modus}", ""]
+        lines = [f"Handel: {handel}", f"Modus: {modus}", f"Strategi: {config.STRATEGY}", ""]
         if executor.ea_mode() and config.RISK_USD > 0:
             lines += [f"Risiko: {config.RISK_USD:g} $ → Mål: {config.RISK_USD * config.RISK_REWARD:g} $ "
                       f"(1:{config.RISK_REWARD:g})",

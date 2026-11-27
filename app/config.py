@@ -33,6 +33,8 @@ def _num(name: str, default: float) -> float:
 
 # AUTO_TRADE=on: trend-signaler sendes rett til MT5 uten APPROVE/REJECT i Telegram
 AUTO_TRADE = os.getenv("AUTO_TRADE", "on").strip().lower() in ("on", "true", "1")
+# Navnet paa aktiv strategi, vises i /status. Endres i Render (STRATEGY).
+STRATEGY = os.getenv("STRATEGY", "").strip() or "5M SMT NAS100/US500 + 24t trendfilter"
 # Noedstopp: ingen ordre sendes uten EXECUTION_ENABLED=on
 EXECUTION_ENABLED = os.getenv("EXECUTION_ENABLED", "off").strip().lower() in ("on", "true", "1")
 # "metaapi" = Render sender ordren via MetaApi.cloud
