@@ -27,9 +27,17 @@ def _add_missing_columns() -> None:
             if col.name in existing:
                 continue
             col_type = col.type.compile(dialect=engine.dialect)
-            with engine.begin() as conn:
-                conn.execute(text(f'ALTER TABLE {table.name} ADD COLUMN {col.name} {col_type}'))
-            log.info("La til kolonne %s.%s", table.name, col.name)
+            # IF NOT EXISTS: flere tjenester kan starte samtidig mot samme database
+            if_not = "IF NOT EXISTS " if engine.dialect.name == "postgresql" else ""
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(f'ALTER TABLE {table.name} ADD COLUMN {if_not}{col.name} {col_type}'))
+                log.info("La til kolonne %s.%s", table.name, col.name)
+            except Exception as e:  # kolonnen ble lagt til av en annen prosess
+                if "duplicate" in str(e).lower() or "already exists" in str(e).lower():
+                    log.info("Kolonne %s.%s fantes allerede", table.name, col.name)
+                else:
+                    raise
 
 
 def init_db() -> None:
