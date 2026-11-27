@@ -161,10 +161,11 @@ def check_ea_key(value: str | None) -> None:
 
 
 @app.get("/mt5/next", response_class=PlainTextResponse)
-async def mt5_next(key: str = Query(...), account: str = Query(""), algo: str = Query("")):
+async def mt5_next(key: str = Query(...), account: str = Query(""), algo: str = Query(""),
+                   vps: str = Query("")):
     """EA-en i MT5 henter neste godkjente ordre her. algo=1/0: Algo Trading på/av i MT5."""
     check_ea_key(key)
-    return await ea_bridge.next_order(account, algo)
+    return await ea_bridge.next_order(account, algo, vps)
 
 
 @app.post("/mt5/result", response_class=PlainTextResponse)
