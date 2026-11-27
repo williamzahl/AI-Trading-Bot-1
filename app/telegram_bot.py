@@ -94,6 +94,12 @@ def signal_text(sig: Signal) -> str:
     return "\n".join(lines)
 
 
+def mode_text() -> str:
+    if config.AUTO_TRADE:
+        return "Modus: 🤖 AUTOMATISK. Trend-signaler handles uten APPROVE, du faar bare varsler"
+    return "Modus: ✋ MANUELL. Hvert signal maa godkjennes med APPROVE"
+
+
 def _keyboard(sig_id: int) -> dict:
     return {"inline_keyboard": [[
         {"text": "✅ APPROVE", "callback_data": f"approve:{sig_id}"},
@@ -167,12 +173,13 @@ async def _handle_message(msg: dict) -> None:
     if text.startswith("/handel_paa"):
         executor.set_paused(False)
         ok, why = executor.state()
-        await call("sendMessage", chat_id=chat_id, text=f"Handel: {why}")
+        await call("sendMessage", chat_id=chat_id, text=f"Handel: {why}\n{mode_text()}")
         return
 
     if text.startswith("/status"):
         ok, why = executor.state()
         lines = [f"Handel: {why}",
+                 mode_text(),
                  f"Lot: {config.TRADE_LOT} | SL {config.STOP_LOSS_PCT}% | TP {config.TAKE_PROFIT_PCT}%",
                  f"Maks aapne posisjoner: {config.MAX_OPEN_POSITIONS} | Symboler: {', '.join(config.ALLOWED_SYMBOLS)}"]
         if executor.ea_mode():
