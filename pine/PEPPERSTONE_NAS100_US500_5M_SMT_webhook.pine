@@ -17,11 +17,11 @@ int SOURCE_SECONDS = 300
 int SOURCE_MS = SOURCE_SECONDS * 1000
 int REFERENCE_CAPACITY = 32
 string GROUP_DETECTION = "5M SMT Detection"
-int drawingPivotStrength = input.int(5, "SMT Drawing Pivot", minval=1, maxval=10, group=GROUP_DETECTION,
-     tooltip="5M candles on each side of a swing high/low. 5 = the swing must hold for 25 minutes on both sides.")
-int majorLookbackBars = input.int(36, "Major swing: lowest low / highest high of last N 5M bars", minval=0, maxval=300, group=GROUP_DETECTION,
-     tooltip="A swing only counts if it is the lowest low (or highest high) of the previous N 5M candles. 36 = 3 hours. Removes small swings in the middle of a range. 0 = off.")
-float minSwingATR = input.float(1.5, "Major swing: minimum move away (x ATR)", minval=0.0, maxval=10.0, step=0.1, group=GROUP_DETECTION,
+int drawingPivotStrength = input.int(3, "SMT Drawing Pivot", minval=1, maxval=10, group=GROUP_DETECTION,
+     tooltip="5M candles on each side of a swing high/low. 3 = the swing must hold for 15 minutes on both sides.")
+int majorLookbackBars = input.int(24, "Major swing: lowest low / highest high of last N 5M bars", minval=0, maxval=300, group=GROUP_DETECTION,
+     tooltip="A swing only counts if it is the lowest low (or highest high) of the previous N 5M candles. 24 = 2 hours. Removes small swings in the middle of a range. 0 = off.")
+float minSwingATR = input.float(1.0, "Major swing: minimum move away (x ATR)", minval=0.0, maxval=10.0, step=0.1, group=GROUP_DETECTION,
      tooltip="Price must have moved at least this many ATR(14) away from the swing before it is swept. Removes levels that sit just next to each other. 0 = off.")
 int alertPivotStrength = input.int(0, "Alert Pivot", minval=0, maxval=10, group=GROUP_DETECTION,
      tooltip="Retained for settings compatibility. Alerts now use the validated Drawing Pivot event so each drawn SMT and its alert share the same pivot pair.")
@@ -29,11 +29,18 @@ int swingToleranceBars = input.int(1, "Swing matching tolerance (5M bars)", minv
 int maxSwingDistanceBars = input.int(100, "Maximum distance from matched swing (5M bars)", minval=1, maxval=1000, group=GROUP_DETECTION)
 int pivotQueueCapacity = math.min(32, swingToleranceBars + drawingPivotStrength + 2)
 int alertPivotQueueCapacity = math.min(32, swingToleranceBars + alertPivotStrength + 2)
-float minimumStrength = input.float(40.0, "Minimum SMT strength (%)", minval=0.0, maxval=100.0, step=1.0, group=GROUP_DETECTION)
-int minimumDivergenceTicks = input.int(5, "Minimum divergence distance (sweeper ticks)", minval=0, maxval=10000, group=GROUP_DETECTION,
-     tooltip="Measured in the symbol's own tick size (syminfo.mintick). Pepperstone index CFDs tick in 0.1 points, so 5 ticks = 0.5 points, the same distance as 2 ticks on MNQ/MES.")
+float minimumStrength = input.float(35.0, "Minimum SMT strength (%)", minval=0.0, maxval=100.0, step=1.0, group=GROUP_DETECTION)
+int minimumDivergenceTicks = input.int(10, "Minimum divergence distance (sweeper ticks)", minval=0, maxval=10000, group=GROUP_DETECTION,
+     tooltip="Measured in the symbol's own tick size (syminfo.mintick). Pepperstone index CFDs tick in 0.1 points, so 10 ticks = 1 point.")
 bool useMinimumPercentDifference = input.bool(false, "Use minimum percentage difference", group=GROUP_DETECTION)
 float minimumPercentDifference = input.float(0.10, "Minimum percentage difference (%)", minval=0.0, maxval=10.0, step=0.01, group=GROUP_DETECTION)
+string GROUP_LEVELS = "Key levels (only logical SMTs)"
+int rangeBars = input.int(144, "Not mid-range: range window (5M bars)", minval=0, maxval=500, group=GROUP_LEVELS,
+     tooltip="The swing high must sit in the top part (swing low in the bottom part) of the high-low range of the last N 5M candles. 144 = 12 hours. Removes swings in the middle of the day's range. 0 = off.")
+float rangeEdgePct = input.float(40.0, "Not mid-range: swing must be in top/bottom % of range", minval=5.0, maxval=100.0, step=5.0, group=GROUP_LEVELS,
+     tooltip="40 = a swing high must be in the top 40% of the range, a swing low in the bottom 40%. 100 = off.")
+float magnetATR = input.float(0.5, "Skip if an untaken key level is within (x ATR) beyond the SMT", minval=0.0, maxval=5.0, step=0.1, group=GROUP_LEVELS,
+     tooltip="Key levels: previous day high/low, last Asia / London / New York session high/low that has not been taken yet, and today's high/low. If such a level sits just above a bearish SMT (or just below a bullish one) on NAS100, price will probably run it first, so the SMT is skipped. Sessions in New York time: Asia 18:00-02:00, London 02:00-08:30, New York 08:30-17:00. 0 = off.")
 string GROUP_ALERTS = "Alerts"
 bool enableAlerts = input.bool(true, "Enable SMT alerts", group=GROUP_ALERTS,
      tooltip="Alerts use confirmed 5M source bars on supported time-based chart timeframes. Drawings are shown only on charts at or below 5 minutes.")
@@ -147,6 +154,15 @@ type SourceBundle
     float prevPivotLow
     int prevPivotLowTime
     float prevAtrValue
+    // Nearest two untaken key levels above the candle high / below the candle low.
+    float magnetAbove1 = na
+    float magnetAbove2 = na
+    float magnetBelow1 = na
+    float magnetBelow2 = na
+    float prevMagnetAbove1 = na
+    float prevMagnetAbove2 = na
+    float prevMagnetBelow1 = na
+    float prevMagnetBelow2 = na
 type PendingSmt
     string eventId
     bool bullish
@@ -178,6 +194,18 @@ type SweepReference
     bool nasTaken = false
     bool spxTaken = false
     bool divergedNow = false
+// Keeps the two nearest levels above (or below) refPrice.
+f_nearest2(float n1, float n2, float level, float refPrice, bool above) =>
+    float best1 = n1
+    float best2 = n2
+    bool valid = not na(level) and not na(refPrice) and (above ? level > refPrice : level < refPrice)
+    if valid
+        if na(best1) or (above ? level < best1 : level > best1)
+            best2 := best1
+            best1 := level
+        else if level != best1 and (na(best2) or (above ? level < best2 : level > best2))
+            best2 := level
+    [best1, best2]
 // This runs inside the explicit symbol/"5" request. No chart timeframe data
 // and no 1-minute data enter the pivot calculation. The host only consumes a
 // source candle after its close timestamp has passed.
@@ -202,6 +230,89 @@ f_sourceBundle(int drawingStrength, int alertStrength, bool includeHighPivots, b
             swingLow := na
         if not na(swingHigh) and swingHigh < majorHigh
             swingHigh := na
+    // Not mid-range: the swing must sit near the top (high) or bottom (low)
+    // of the last rangeBars candles.
+    float rangeTop = ta.highest(high, math.max(1, rangeBars))
+    float rangeBottom = ta.lowest(low, math.max(1, rangeBars))
+    float rangeSize = rangeTop - rangeBottom
+    if rangeBars > 0 and rangeEdgePct < 100 and not na(rangeSize) and rangeSize > 0
+        if not na(swingHigh) and (swingHigh - rangeBottom) / rangeSize < 1.0 - rangeEdgePct / 100.0
+            swingHigh := na
+        if not na(swingLow) and (rangeTop - swingLow) / rangeSize < 1.0 - rangeEdgePct / 100.0
+            swingLow := na
+    // Key levels on the New York clock. Trading day starts with Asia (18:00 NY).
+    int nyMinute = hour(time, "America/New_York") * 60 + minute(time, "America/New_York")
+    int sessionNow = nyMinute >= 18 * 60 or nyMinute < 2 * 60 ? 0 : nyMinute < 8 * 60 + 30 ? 1 : 2
+    var int sessionId = -1
+    var float sessHigh = na
+    var float sessLow = na
+    var float dayHigh = na
+    var float dayLow = na
+    var float pdHigh = na
+    var float pdLow = na
+    var float asiaHigh = na
+    var float asiaLow = na
+    var float lonHigh = na
+    var float lonLow = na
+    var float nyHigh = na
+    var float nyLow = na
+    if sessionNow != sessionId
+        if sessionId == 0
+            asiaHigh := sessHigh
+            asiaLow := sessLow
+        else if sessionId == 1
+            lonHigh := sessHigh
+            lonLow := sessLow
+        else if sessionId == 2
+            nyHigh := sessHigh
+            nyLow := sessLow
+        if sessionNow == 0
+            pdHigh := dayHigh
+            pdLow := dayLow
+            dayHigh := na
+            dayLow := na
+        sessionId := sessionNow
+        sessHigh := na
+        sessLow := na
+    // A completed level that price trades through is taken and no longer a magnet.
+    if not na(pdHigh) and high > pdHigh
+        pdHigh := na
+    if not na(pdLow) and low < pdLow
+        pdLow := na
+    if not na(asiaHigh) and high > asiaHigh
+        asiaHigh := na
+    if not na(asiaLow) and low < asiaLow
+        asiaLow := na
+    if not na(lonHigh) and high > lonHigh
+        lonHigh := na
+    if not na(lonLow) and low < lonLow
+        lonLow := na
+    if not na(nyHigh) and high > nyHigh
+        nyHigh := na
+    if not na(nyLow) and low < nyLow
+        nyLow := na
+    // Running session / day extremes from earlier candles count only if above
+    // (below) this candle, so they are checked before this candle is added.
+    float magA1 = na
+    float magA2 = na
+    float magB1 = na
+    float magB2 = na
+    [a1, a2] = f_nearest2(magA1, magA2, pdHigh, high, true)
+    [a3, a4] = f_nearest2(a1, a2, asiaHigh, high, true)
+    [a5, a6] = f_nearest2(a3, a4, lonHigh, high, true)
+    [a7, a8] = f_nearest2(a5, a6, nyHigh, high, true)
+    [a9, a10] = f_nearest2(a7, a8, sessHigh, high, true)
+    [a11, a12] = f_nearest2(a9, a10, dayHigh, high, true)
+    [b1, b2] = f_nearest2(magB1, magB2, pdLow, low, false)
+    [b3, b4] = f_nearest2(b1, b2, asiaLow, low, false)
+    [b5, b6] = f_nearest2(b3, b4, lonLow, low, false)
+    [b7, b8] = f_nearest2(b5, b6, nyLow, low, false)
+    [b9, b10] = f_nearest2(b7, b8, sessLow, low, false)
+    [b11, b12] = f_nearest2(b9, b10, dayLow, low, false)
+    sessHigh := na(sessHigh) ? high : math.max(sessHigh, high)
+    sessLow := na(sessLow) ? low : math.min(sessLow, low)
+    dayHigh := na(dayHigh) ? high : math.max(dayHigh, high)
+    dayLow := na(dayLow) ? low : math.min(dayLow, low)
     int swingHighTime = not na(swingHigh) ? time[drawingStrength] : na
     int swingLowTime = not na(swingLow) ? time[drawingStrength] : na
     int alertSwingHighTime = not na(alertSwingHigh) ? time[alertStrength] : na
@@ -213,7 +324,8 @@ f_sourceBundle(int drawingStrength, int alertStrength, bool includeHighPivots, b
          close, time, time_close, syminfo.mintick,
          swingHigh, swingHighTime, swingLow, swingLowTime, alertSwingHigh, alertSwingHighTime, alertSwingLow, alertSwingLowTime, atrValue,
          bundleHigh[1], bundleLow[1], close[1], time[1], time_close[1],
-         swingHigh[1], swingHighTime[1], swingLow[1], swingLowTime[1], atrValue[1])
+         swingHigh[1], swingHighTime[1], swingLow[1], swingLowTime[1], atrValue[1],
+         a11, a12, b11, b12, a11[1], a12[1], b11[1], b12[1])
 // calc_bars_count is a compile-time constant in Pine. These small wrappers let
 // the user-selected signal cap choose a matching, bounded 5M history window.
 f_request900(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
@@ -347,7 +459,8 @@ f_previousBundle(SourceBundle source) =>
             previous := SourceBundle.new(source.prevHighValue, source.prevLowValue, source.prevCloseValue,
                  source.prevSourceTime, source.prevSourceClose, source.tickSize,
                  source.prevPivotHigh, source.prevPivotHighTime, source.prevPivotLow, source.prevPivotLowTime,
-                 na, na, na, na, source.prevAtrValue)
+                 na, na, na, na, source.prevAtrValue,
+                 source.prevMagnetAbove1, source.prevMagnetAbove2, source.prevMagnetBelow1, source.prevMagnetBelow2)
     previous
 // Most extreme high (highSide) or low after afterTime, earliest candle on ties.
 f_extremeAfter(array<SourceCandle> candles, int afterTime, bool highSide) =>
@@ -404,7 +517,7 @@ f_registerReference(array<SweepReference> refs, array<SourceCandle> nasCandles, 
 f_evaluateSweeps(array<SweepReference> refs, array<SourceCandle> nasCandles, array<SourceCandle> spxCandles,
      bool highSide, int candleTime, int candleClose,
      float nasExtreme, float spxExtreme, float nasATR, float spxATR, float nasTick, float spxTick,
-     int maxReferenceAgeMs) =>
+     int maxReferenceAgeMs, float nasMagnet1, float nasMagnet2) =>
     bool found = false
     float bestRank = na
     int bestRefNASTime = na
@@ -486,7 +599,21 @@ f_evaluateSweeps(array<SweepReference> refs, array<SourceCandle> nasCandles, arr
                          nasSweeper ? activeRef.nasTime : activeRef.spxTime, not highSide)
                     float awayDistance = highSide ? sweepRef - awayPrice : awayPrice - sweepRef
                     swingPass := not na(awayDistance) and not na(sweepATR) and sweepATR > 0 and awayDistance >= minSwingATR * sweepATR
-                if segmentClear and tickPass and percentPass and strengthPass and swingPass
+                // Key-level check on NAS100 (the traded market): skip the SMT if an
+                // untaken key level sits just beyond it. Levels at the NAS swing
+                // itself (e.g. it is the session high) are part of the SMT, not a magnet.
+                bool magnetPass = true
+                if magnetATR > 0 and endpointsKnown and not na(nasATR) and nasATR > 0
+                    float barrier = highSide ? math.max(nasEnd, activeRef.nasPrice) : math.min(nasEnd, activeRef.nasPrice)
+                    float eps = 0.1 * nasATR
+                    float magnet = na
+                    if not na(nasMagnet1) and (highSide ? nasMagnet1 > barrier + eps : nasMagnet1 < barrier - eps)
+                        magnet := nasMagnet1
+                    else if not na(nasMagnet2) and (highSide ? nasMagnet2 > barrier + eps : nasMagnet2 < barrier - eps)
+                        magnet := nasMagnet2
+                    if not na(magnet)
+                        magnetPass := math.abs(magnet - barrier) >= magnetATR * nasATR
+                if segmentClear and tickPass and percentPass and strengthPass and swingPass and magnetPass
                     // Most extreme reference wins: highest high / lowest low.
                     float rank = activeRef.nasPrice
                     if not found or (highSide ? rank > bestRank : rank < bestRank)
@@ -504,7 +631,8 @@ f_evaluateSweeps(array<SweepReference> refs, array<SourceCandle> nasCandles, arr
                     reason := not endpointsKnown ? "source candle history incomplete" :
                          not segmentClear ? "segment crosses an intermediate 5M candle on NAS or SPX" :
                          not tickPass ? "divergence ticks below minimum" :
-                         not percentPass ? "percent filter" : not strengthPass ? "strength below minimum" : "not a major swing (too small move away)"
+                         not percentPass ? "percent filter" : not strengthPass ? "strength below minimum" :
+                         not swingPass ? "not a major swing (too small move away)" : "untaken key level just beyond the SMT"
         if removeRef
             array.remove(refs, index)
         else
@@ -960,7 +1088,8 @@ if canRunEngine
                     [bearFound, bearRefNASTime, bearRefNASPrice, bearRefSPXTime, bearRefSPXPrice, bearSweepTime,
                          bearEndNASPrice, bearEndSPXPrice, bearNASSwept, bearDivergedCount, bearReason] =
                          f_evaluateSweeps(activeHighReferences, nasSourceCandles, spxSourceCandles, true, nasTime, nasClose,
-                         nasHigh, spxHigh, nasATR, spxATR, nasTick, spxTick, maxReferenceAgeMs)
+                         nasHigh, spxHigh, nasATR, spxATR, nasTick, spxTick, maxReferenceAgeMs,
+                         nasSource.magnetAbove1, nasSource.magnetAbove2)
                     if bearFound
                         string eventKey = "S:" + str.tostring(bearRefNASTime) + ":" + str.tostring(bearRefSPXTime) + ">" + str.tostring(bearSweepTime) + ":" + str.tostring(bearSweepTime) + ":C:" + str.tostring(nasClose)
                         if not array.includes(processedEventKeys, eventKey)
@@ -1003,7 +1132,8 @@ if canRunEngine
                     [bullFound, bullRefNASTime, bullRefNASPrice, bullRefSPXTime, bullRefSPXPrice, bullSweepTime,
                          bullEndNASPrice, bullEndSPXPrice, bullNASSwept, bullDivergedCount, bullReason] =
                          f_evaluateSweeps(activeLowReferences, nasSourceCandles, spxSourceCandles, false, nasTime, nasClose,
-                         nasLow, spxLow, nasATR, spxATR, nasTick, spxTick, maxReferenceAgeMs)
+                         nasLow, spxLow, nasATR, spxATR, nasTick, spxTick, maxReferenceAgeMs,
+                         nasSource.magnetBelow1, nasSource.magnetBelow2)
                     if bullFound
                         string eventKey = "B:" + str.tostring(bullRefNASTime) + ":" + str.tostring(bullRefSPXTime) + ">" + str.tostring(bullSweepTime) + ":" + str.tostring(bullSweepTime) + ":C:" + str.tostring(nasClose)
                         if not array.includes(processedEventKeys, eventKey)
