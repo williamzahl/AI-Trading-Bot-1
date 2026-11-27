@@ -180,7 +180,7 @@ type PendingSmt
     int completedCandlesSinceConfirmation
     bool alertSent
     string sweeper = ""
-    float smtLevel = na  // low/high (on the chart symbol) of the candle that formed the SMT
+    float smtLevel = na  // SMT extreme on the chart symbol: lowest of swing low and sweep low (bullish), highest of swing high and sweep high (bearish)
 type SourceCandle
     int sourceTime
     int sourceClose
@@ -1131,7 +1131,7 @@ if canRunEngine
                                 array.push(alertProcessedKeys, eventKey)
                                 while array.size(alertProcessedKeys) > 512
                                     array.shift(alertProcessedKeys)
-                                array.push(pendingAlerts, PendingSmt.new(eventKey, false, "1", nasClose, chartConfirmationClose, 0, false, bearNASSwept ? nasTicker : spxTicker, drawUsingNASPrices ? bearEndNASPrice : bearEndSPXPrice))
+                                array.push(pendingAlerts, PendingSmt.new(eventKey, false, "1", nasClose, chartConfirmationClose, 0, false, bearNASSwept ? nasTicker : spxTicker, drawUsingNASPrices ? math.max(bearRefNASPrice, bearEndNASPrice) : math.max(bearRefSPXPrice, bearEndSPXPrice)))
                             int lineStartTime = drawUsingNASPrices ? bearRefNASTime : bearRefSPXTime
                             float lineStartPrice = drawUsingNASPrices ? bearRefNASPrice : bearRefSPXPrice
                             float lineEndPrice = drawUsingNASPrices ? bearEndNASPrice : bearEndSPXPrice
@@ -1181,7 +1181,7 @@ if canRunEngine
                                 array.push(alertProcessedKeys, eventKey)
                                 while array.size(alertProcessedKeys) > 512
                                     array.shift(alertProcessedKeys)
-                                array.push(pendingAlerts, PendingSmt.new(eventKey, true, "1", nasClose, chartConfirmationClose, 0, false, bullNASSwept ? nasTicker : spxTicker, drawUsingNASPrices ? bullEndNASPrice : bullEndSPXPrice))
+                                array.push(pendingAlerts, PendingSmt.new(eventKey, true, "1", nasClose, chartConfirmationClose, 0, false, bullNASSwept ? nasTicker : spxTicker, drawUsingNASPrices ? math.min(bullRefNASPrice, bullEndNASPrice) : math.min(bullRefSPXPrice, bullEndSPXPrice)))
                             int lineStartTime = drawUsingNASPrices ? bullRefNASTime : bullRefSPXTime
                             float lineStartPrice = drawUsingNASPrices ? bullRefNASPrice : bullRefSPXPrice
                             float lineEndPrice = drawUsingNASPrices ? bullEndNASPrice : bullEndSPXPrice
