@@ -8,7 +8,7 @@
 //|   - legg til https://smt-webhook-4dgq.onrender.com               |
 //+------------------------------------------------------------------+
 #property copyright "SMT Bot"
-#property version   "1.30"
+#property version   "1.31"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -193,7 +193,8 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
 void OnTimer()
   {
    string url = InpBaseUrl + "/mt5/next?key=" + UrlEncode(InpKey) +
-                "&account=" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN));
+                "&account=" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) +
+                "&algo=" + ((TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) && MQLInfoInteger(MQL_TRADE_ALLOWED)) ? "1" : "0");
    string body;
    if(!Http("GET", url, body)) return;
    if(body == "NONE" || StringLen(body) == 0) return;
