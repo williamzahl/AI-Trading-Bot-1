@@ -8,7 +8,7 @@
 //|   - legg til https://smt-webhook-4dgq.onrender.com               |
 //+------------------------------------------------------------------+
 #property copyright "SMT Bot"
-#property version   "1.10"
+#property version   "1.20"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -98,12 +98,14 @@ string Field(const string text, const string key)
   }
 
 void Report(const string id, const bool ok, const string ticket, const double price,
-            const double sl, const double tp, const string msg, const int digits)
+            const double sl, const double tp, const string msg, const int digits,
+            const double lot = 0, const double risk = 0)
   {
    string url = InpBaseUrl + "/mt5/result?key=" + UrlEncode(InpKey) + "&id=" + id +
                 "&ok=" + (ok ? "1" : "0") + "&ticket=" + ticket +
                 "&price=" + DoubleToString(price, digits) +
                 "&sl=" + DoubleToString(sl, digits) + "&tp=" + DoubleToString(tp, digits) +
+                "&lot=" + DoubleToString(lot, 2) + "&risk=" + DoubleToString(risk, 2) +
                 "&msg=" + UrlEncode(msg);
    string body;
    for(int attempt = 0; attempt < 3; attempt++)
@@ -200,10 +202,16 @@ void OnTimer()
    string symbol = Field(body, "symbol");
    string side   = Field(body, "side");
    double lot    = StringToDouble(Field(body, "lot"));
-   double slPct  = StringToDouble(Field(body, "sl_pct"));
-   double tpPct  = StringToDouble(Field(body, "tp_pct"));
-   int    maxPos = (int)StringToInteger(Field(body, "max_pos"));
-   Print("SMT: fikk ordre #", id, " ", side, " ", lot, " ", symbol);
+   double riskUsd = StringToDouble(Field(body, "risk_usd"));
+   double rr      = StringToDouble(Field(body, "rr"));
+   int    lookback= (int)StringToInteger(Field(body, "lookback"));
+   double buffer  = StringToDouble(Field(body, "buffer"));
+   double maxLot  = StringToDouble(Field(body, "max_lot"));
+   double maxSlPct= StringToDouble(Field(body, "max_sl_pct"));
+   int    maxPos  = (int)StringToInteger(Field(body, "max_pos"));
+   if(rr <= 0) rr = 3;
+   if(lookback <= 0) lookback = 6;
+   Print("SMT: fikk ordre #", id, " ", side, " ", symbol, " risiko ", riskUsd, " R:R 1:", rr);
 
    if(!SymbolSelect(symbol, true))
      { Report(id, false, "", 0, 0, 0, "Symbol " + symbol + " finnes ikke i MT5", 2); return; }
@@ -213,20 +221,64 @@ void OnTimer()
      { Report(id, false, "", 0, 0, 0, "Algo Trading er slaatt av i MT5", digits); return; }
    if(maxPos > 0 && OpenPositions() >= maxPos)
      { Report(id, false, "", 0, 0, 0, "SKIP: allerede " + IntegerToString(OpenPositions()) + " aapne posisjoner", digits); return; }
-   if(slPct <= 0 || tpPct <= 0)
-     { Report(id, false, "", 0, 0, 0, "SL/TP mangler", digits); return; }
 
    MqlTick tick;
    if(!SymbolInfoTick(symbol, tick) || tick.ask <= 0)
      { Report(id, false, "", 0, 0, 0, "Ingen pris for " + symbol + " (marked stengt?)", digits); return; }
 
-   lot = NormalizeLot(symbol, lot);
    bool buy = (side == "BUY");
    double price = buy ? tick.ask : tick.bid;
-   double slDist = price * slPct / 100.0;
-   double tpDist = price * tpPct / 100.0;
-   double sl = NormalizeDouble(buy ? price - slDist : price + slDist, digits);
-   double tp = NormalizeDouble(buy ? price + tpDist : price - tpDist, digits);
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+
+   // SL ALLTID under laveste low (kjoep) / over hoeyeste high (salg) paa 5M,
+   // inkludert lyset som er under dannelse, pluss en liten buffer.
+   double sl;
+   if(buy)
+     {
+      int idx = iLowest(symbol, PERIOD_M5, MODE_LOW, lookback, 0);
+      if(idx < 0) { Report(id, false, "", price, 0, 0, "Fant ikke 5M-lows for SL", digits); return; }
+      sl = MathMin(iLow(symbol, PERIOD_M5, idx), tick.bid) - buffer;
+     }
+   else
+     {
+      int idx = iHighest(symbol, PERIOD_M5, MODE_HIGH, lookback, 0);
+      if(idx < 0) { Report(id, false, "", price, 0, 0, "Fant ikke 5M-highs for SL", digits); return; }
+      sl = MathMax(iHigh(symbol, PERIOD_M5, idx), tick.ask) + buffer;
+     }
+   sl = NormalizeDouble(sl, digits);
+
+   // Megleren krever en minste avstand; da flyttes SL lenger unna (aldri naermere).
+   double minDist = (SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL) + 1) * point;
+   double dist = buy ? price - sl : sl - price;
+   if(dist < minDist)
+     {
+      dist = minDist;
+      sl = NormalizeDouble(buy ? price - dist : price + dist, digits);
+     }
+   if(maxSlPct > 0 && dist / price * 100.0 > maxSlPct)
+     { Report(id, false, "", price, sl, 0, "SKIP: SL er " + DoubleToString(dist / price * 100.0, 2) +
+              "% unna (maks " + DoubleToString(maxSlPct, 2) + "%)", digits); return; }
+   double tp = NormalizeDouble(buy ? price + rr * dist : price - rr * dist, digits);
+
+   // Lot ut fra fast risiko i USD: tap per lot = avstand / ticksize * tickverdi
+   double tickSize  = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tickValue = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE_LOSS);
+   if(tickValue <= 0) tickValue = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+   if(tickSize <= 0 || tickValue <= 0)
+     { Report(id, false, "", price, sl, tp, "Mangler tickverdi for " + symbol, digits); return; }
+   double lossPerLot = dist / tickSize * tickValue;
+
+   if(riskUsd > 0)
+     {
+      lot = riskUsd / lossPerLot;
+      double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+      if(lot < minLot)
+        { Report(id, false, "", price, sl, tp, "SKIP: SL for lang, minste lot gir mer enn " +
+                 DoubleToString(riskUsd, 0) + " $ risiko", digits); return; }
+     }
+   if(maxLot > 0 && lot > maxLot) lot = maxLot;
+   lot = NormalizeLot(symbol, lot);
+   double risk = lot * lossPerLot;
    string comment = "SMT #" + id;
 
    bool sent = buy ? trade.Buy(lot, symbol, 0, sl, tp, comment)
@@ -235,10 +287,11 @@ void OnTimer()
    if(sent && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_PLACED || rc == TRADE_RETCODE_DONE_PARTIAL))
      {
       double fill = trade.ResultPrice() > 0 ? trade.ResultPrice() : price;
-      Report(id, true, IntegerToString((long)trade.ResultOrder()), fill, sl, tp, "OK", digits);
+      double realRisk = MathAbs(fill - sl) / tickSize * tickValue * lot;
+      Report(id, true, IntegerToString((long)trade.ResultOrder()), fill, sl, tp, "OK", digits, lot, realRisk);
      }
    else
       Report(id, false, "", price, sl, tp,
-             "retcode " + IntegerToString(rc) + " " + trade.ResultRetcodeDescription(), digits);
+             "retcode " + IntegerToString(rc) + " " + trade.ResultRetcodeDescription(), digits, lot, risk);
   }
 //+------------------------------------------------------------------+

@@ -68,7 +68,10 @@ async def next_order(account: str = "") -> str:
             log.info("EA hentet ordre #%s %s %s", sig.id, side, symbol)
             return (f"id={sig.id};symbol={symbol};side={side};lot={config.TRADE_LOT};"
                     f"sl_pct={config.STOP_LOSS_PCT};tp_pct={config.TAKE_PROFIT_PCT};"
-                    f"max_pos={config.MAX_OPEN_POSITIONS}")
+                    f"max_pos={config.MAX_OPEN_POSITIONS};risk_usd={config.RISK_USD};"
+                    f"rr={config.RISK_REWARD};lookback={config.SL_LOOKBACK_BARS};"
+                    f"buffer={config.SL_BUFFER_POINTS};max_lot={config.MAX_LOT};"
+                    f"max_sl_pct={config.MAX_SL_PCT}")
     return "NONE"
 
 
@@ -79,7 +82,8 @@ def _f(v: str) -> float | None:
         return None
 
 
-async def record_result(sig_id: int, ok: bool, ticket: str, price: str, sl: str, tp: str, msg: str) -> None:
+async def record_result(sig_id: int, ok: bool, ticket: str, price: str, sl: str, tp: str, msg: str,
+                        lot: str = "", risk: str = "") -> None:
     with SessionLocal() as s:
         sig = s.get(Signal, sig_id)
         if not sig:
@@ -90,9 +94,13 @@ async def record_result(sig_id: int, ok: bool, ticket: str, price: str, sl: str,
             sig.exec_order_id = ticket[:64] or None
             sig.exec_price, sig.exec_sl, sig.exec_tp = _f(price), _f(sl), _f(tp)
             icon = "🟢" if (sig.signal or "").upper() == "BUY" else "🔴"
+            sig.exec_lot = _f(lot) or config.TRADE_LOT
+            r = _f(risk)
+            risk_line = (f"Risiko: {r:.0f} $  ->  Maal: {r * config.RISK_REWARD:.0f} $ "
+                         f"(1:{config.RISK_REWARD:g})\n") if r else ""
             text = (f"✅ TRADE TATT #{sig.id}\n"
-                    f"{icon} {sig.signal} {config.TRADE_LOT} lot {symbol}\n"
-                    f"Entry: {price}\nSL: {sl}\nTP: {tp}\n"
+                    f"{icon} {sig.signal} {sig.exec_lot:g} lot {symbol}\n"
+                    f"Entry: {price}\nSL: {sl}\nTP: {tp}\n{risk_line}"
                     f"Ticket: {ticket or '-'}")
         else:
             sig.exec_status = "SKIPPED" if msg.startswith("SKIP") else "FAILED"
@@ -127,7 +135,7 @@ async def record_close(sig_id: int, price: str, profit: str, reason: str) -> Non
         opened = sig.exec_at or sig.received_at
         mins = (sig.closed_at - _aware(opened)).total_seconds() / 60 if opened else None
         lines = [f"{icon} TRADE LUKKET #{sig.id}",
-                 f"{sig.signal} {config.TRADE_LOT} lot {symbol}",
+                 f"{sig.signal} {(sig.exec_lot or config.TRADE_LOT):g} lot {symbol}",
                  f"Entry: {sig.exec_price if sig.exec_price is not None else '-'} -> Exit: {price}",
                  f"Resultat: {p:+.2f} USD" if p is not None else "Resultat: -",
                  f"Grunn: {REASONS.get(reason.upper(), reason)}"]

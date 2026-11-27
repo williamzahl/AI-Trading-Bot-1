@@ -34,6 +34,7 @@ class Signal(Base):
     exec_order_id: Mapped[str | None] = mapped_column(String(64))
     exec_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     exec_price: Mapped[float | None] = mapped_column(Float)
+    exec_lot: Mapped[float | None] = mapped_column(Float)
     exec_sl: Mapped[float | None] = mapped_column(Float)
     exec_tp: Mapped[float | None] = mapped_column(Float)
     # Etter at traden er lukket (meldt av EA-en)

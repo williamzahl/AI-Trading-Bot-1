@@ -170,10 +170,11 @@ async def mt5_next(key: str = Query(...), account: str = Query("")):
 @app.post("/mt5/result", response_class=PlainTextResponse)
 async def mt5_result(key: str = Query(...), id: int = Query(...), ok: int = Query(0),
                      ticket: str = Query(""), price: str = Query(""), sl: str = Query(""),
-                     tp: str = Query(""), msg: str = Query("")):
+                     tp: str = Query(""), msg: str = Query(""), lot: str = Query(""),
+                     risk: str = Query("")):
     """EA-en melder resultatet av en ordre her."""
     check_ea_key(key)
-    await ea_bridge.record_result(id, bool(ok), ticket, price, sl, tp, msg[:300])
+    await ea_bridge.record_result(id, bool(ok), ticket, price, sl, tp, msg[:300], lot, risk)
     return "OK"
 
 
