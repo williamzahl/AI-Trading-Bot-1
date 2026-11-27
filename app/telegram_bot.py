@@ -218,6 +218,9 @@ async def _handle_message(msg: dict) -> None:
             else:
                 ago = f"{seen / 60:.0f} min" if seen < 3600 else f"{seen / 3600:.1f} t"
                 lines.append(f"MT5-EA: 🔴 ({ago} siden)")
+            algo = ea_bridge.algo_state()
+            lines.append({"1": "Algo Trading (VPS): PÅ ✅", "0": "Algo Trading (VPS): AV ❌"}.get(
+                algo or "", "Algo Trading (VPS): ukjent (oppdater EA til v1.31)"))
         elif executor.configured():
             try:
                 acc = await executor.account_info()

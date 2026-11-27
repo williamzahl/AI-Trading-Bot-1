@@ -14,6 +14,7 @@ from app.models import Signal
 
 log = logging.getLogger("smt-bot")
 HEARTBEAT_KEY = "ea_last_poll"
+ALGO_KEY = "ea_algo_trading"
 
 
 def _aware(dt: datetime) -> datetime:
@@ -42,14 +43,23 @@ def _smt_level(sig: Signal) -> str:
     return repr(v) if v else ""
 
 
-async def next_order(account: str = "") -> str:
+def algo_state() -> str | None:
+    """'1' = Algo Trading på i MT5, '0' = av, None = ukjent (eldre EA)."""
+    return get_setting(ALGO_KEY) or None
+
+
+async def next_order(account: str = "", algo: str = "") -> str:
     """Neste ordre som tekst, eller 'NONE'."""
     now = datetime.now(timezone.utc)
     set_setting(HEARTBEAT_KEY, now.isoformat())
     if account:
         set_setting("ea_account", account[:64])
+    if algo in ("0", "1"):
+        set_setting(ALGO_KEY, algo)
     ok, _ = executor.state()
-    if not ok:
+    if not ok or algo == "0":
+        # Algo Trading av i MT5: ordren blir liggende i køen til den slås på
+        # (eller går ut på tid), i stedet for å feile.
         return "NONE"
     with SessionLocal() as s:
         rows = (s.query(Signal).filter(Signal.exec_status == "QUEUED")
