@@ -8,7 +8,7 @@
 //|   - legg til https://smt-webhook-4dgq.onrender.com               |
 //+------------------------------------------------------------------+
 #property copyright "SMT Bot"
-#property version   "1.32"
+#property version   "1.33"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -211,6 +211,8 @@ void OnTimer()
    double maxLot  = StringToDouble(Field(body, "max_lot"));
    double maxSlPct= StringToDouble(Field(body, "max_sl_pct"));
    double smtLevel= StringToDouble(Field(body, "smt_level"));
+   double minSl   = StringToDouble(Field(body, "min_sl"));
+   double maxMarginPct = StringToDouble(Field(body, "max_margin_pct"));
    int    maxPos  = (int)StringToInteger(Field(body, "max_pos"));
    if(rr <= 0) rr = 3;
    if(lookback <= 0) lookback = 6;
@@ -262,6 +264,9 @@ void OnTimer()
    // Megleren krever en minste avstand; da flyttes SL lenger unna (aldri naermere).
    double minDist = (SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL) + 1) * point;
    double dist = buy ? price - sl : sl - price;
+   // Minste SL-avstand fra Render: SMT-lowen kan ligge helt inntil inngangen,
+   // da blir lot enorm. SL flyttes lenger unna (aldri naermere).
+   if(minSl > 0 && dist < minSl) minDist = MathMax(minDist, minSl);
    if(dist < minDist)
      {
       dist = minDist;
@@ -289,6 +294,24 @@ void OnTimer()
                  DoubleToString(riskUsd, 0) + " $ risiko", digits); return; }
      }
    if(maxLot > 0 && lot > maxLot) lot = maxLot;
+   // Margin: bruk maks maxMarginPct % av fri margin paa denne traden.
+   if(maxMarginPct > 0)
+     {
+      double marginPerLot = 0;
+      if(OrderCalcMargin(buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, symbol, 1.0, price, marginPerLot) && marginPerLot > 0)
+        {
+         double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+         double marginLot = freeMargin * maxMarginPct / 100.0 / marginPerLot;
+         if(lot > marginLot)
+           {
+            Print("SMT: lot kuttet fra ", lot, " til ", marginLot, " pga. margin");
+            lot = marginLot;
+           }
+         if(lot < SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN))
+           { Report(id, false, "", price, sl, tp, "SKIP: ikke nok fri margin (" +
+                    DoubleToString(freeMargin, 0) + " $)", digits); return; }
+        }
+     }
    lot = NormalizeLot(symbol, lot);
    double risk = lot * lossPerLot;
    string comment = "SMT #" + id;
