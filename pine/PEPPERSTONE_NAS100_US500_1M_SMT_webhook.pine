@@ -1,0 +1,1266 @@
+//@version=6
+indicator("Pepperstone NAS100 / US500 1M SMT TEST", overlay=true, max_lines_count=500, dynamic_requests=true, max_bars_back=2000)
+// TEST VERSION: same logic as the 5M indicator, but on 1-minute candles, so
+// signals come much more often. Only for testing the webhook -> Render -> MT5 chain.
+// CFD version of the MNQ/MES 5M SMT indicator, built for Pepperstone's feed so
+// the TradingView signal matches the prices in the Pepperstone MT5 account.
+// Use it on a PEPPERSTONE:NAS100 or PEPPERSTONE:US500 chart (5M or lower for drawings).
+// Native 5-minute NAS100/US500 data is requested once per symbol. Chart symbol
+// detection is deliberately kept outside the request expressions so it cannot
+// accidentally resolve to NAS100 while evaluating a requested NAS100 context.
+//====================================================
+// Settings
+//====================================================
+string GROUP_SYMBOLS = "Symbols"
+string nasSymbolInput = input.symbol("PEPPERSTONE:NAS100", "Nasdaq 100 CFD", group=GROUP_SYMBOLS)
+string spxSymbolInput = input.symbol("PEPPERSTONE:US500", "S&P 500 CFD", group=GROUP_SYMBOLS,
+     tooltip="The chart you put the indicator on always supplies its own leg, so lines sit exactly on that chart's candles. These inputs set the other leg. Keep both pointing at the same symbols you trade in MT5.")
+int SOURCE_SECONDS = 60
+int SOURCE_MS = SOURCE_SECONDS * 1000
+int REFERENCE_CAPACITY = 32
+string GROUP_DETECTION = "5M SMT Detection"
+int drawingPivotStrength = input.int(3, "SMT Drawing Pivot", minval=1, maxval=10, group=GROUP_DETECTION,
+     tooltip="5M candles on each side of a swing high/low. 3 = the swing must hold for 15 minutes on both sides.")
+int majorLookbackBars = input.int(24, "Major swing: lowest low / highest high of last N 5M bars", minval=0, maxval=300, group=GROUP_DETECTION,
+     tooltip="A swing only counts if it is the lowest low (or highest high) of the previous N 5M candles. 24 = 2 hours. Removes small swings in the middle of a range. 0 = off.")
+float minSwingATR = input.float(1.0, "Major swing: minimum move away (x ATR)", minval=0.0, maxval=10.0, step=0.1, group=GROUP_DETECTION,
+     tooltip="Price must have moved at least this many ATR(14) away from the swing before it is swept. Removes levels that sit just next to each other. 0 = off.")
+int alertPivotStrength = input.int(0, "Alert Pivot", minval=0, maxval=10, group=GROUP_DETECTION,
+     tooltip="Retained for settings compatibility. Alerts now use the validated Drawing Pivot event so each drawn SMT and its alert share the same pivot pair.")
+int swingToleranceBars = input.int(1, "Swing matching tolerance (5M bars)", minval=0, maxval=5, group=GROUP_DETECTION)
+int maxSwingDistanceBars = input.int(100, "Maximum distance from matched swing (5M bars)", minval=1, maxval=1000, group=GROUP_DETECTION)
+int pivotQueueCapacity = math.min(32, swingToleranceBars + drawingPivotStrength + 2)
+int alertPivotQueueCapacity = math.min(32, swingToleranceBars + alertPivotStrength + 2)
+float minimumStrength = input.float(35.0, "Minimum SMT strength (%)", minval=0.0, maxval=100.0, step=1.0, group=GROUP_DETECTION)
+int minimumDivergenceTicks = input.int(10, "Minimum divergence distance (sweeper ticks)", minval=0, maxval=10000, group=GROUP_DETECTION,
+     tooltip="Measured in the symbol's own tick size (syminfo.mintick). Pepperstone index CFDs tick in 0.1 points, so 10 ticks = 1 point.")
+bool useMinimumPercentDifference = input.bool(false, "Use minimum percentage difference", group=GROUP_DETECTION)
+float minimumPercentDifference = input.float(0.10, "Minimum percentage difference (%)", minval=0.0, maxval=10.0, step=0.01, group=GROUP_DETECTION)
+string GROUP_LEVELS = "Key levels (only logical SMTs)"
+int rangeBars = input.int(144, "Not mid-range: range window (5M bars)", minval=0, maxval=500, group=GROUP_LEVELS,
+     tooltip="The swing high must sit in the top part (swing low in the bottom part) of the high-low range of the last N 5M candles. 144 = 12 hours. Removes swings in the middle of the day's range. 0 = off.")
+float rangeEdgePct = input.float(40.0, "Not mid-range: swing must be in top/bottom % of range", minval=5.0, maxval=100.0, step=5.0, group=GROUP_LEVELS,
+     tooltip="40 = a swing high must be in the top 40% of the range, a swing low in the bottom 40%. 100 = off.")
+float magnetATR = input.float(0.5, "Skip if an untaken key level is within (x ATR) beyond the SMT", minval=0.0, maxval=5.0, step=0.1, group=GROUP_LEVELS,
+     tooltip="Key levels: previous day high/low, last Asia / London / New York session high/low that has not been taken yet, and today's high/low. If such a level sits just above a bearish SMT (or just below a bullish one) on NAS100, price will probably run it first, so the SMT is skipped. Sessions in New York time: Asia 18:00-02:00, London 02:00-08:30, New York 08:30-17:00. 0 = off.")
+string GROUP_ALERTS = "Alerts"
+bool enableAlerts = input.bool(true, "Enable SMT alerts", group=GROUP_ALERTS,
+     tooltip="Alerts use confirmed 5M source bars on supported time-based chart timeframes. Drawings are shown only on charts at or below 5 minutes.")
+bool enableBullishAlerts = input.bool(true, "Enable bullish alerts", group=GROUP_ALERTS)
+bool enableBearishAlerts = input.bool(true, "Enable bearish alerts", group=GROUP_ALERTS)
+int candleClosesBeforeAlert = input.int(0, "Additional 5M candles before alert", minval=0, maxval=10, group=GROUP_ALERTS,
+     tooltip="0 alerts at the close of the 5M candle that confirms the SMT. 1 alerts at the close of the next 5M candle, 2 at the close of the second following 5M candle, and so on.")
+int pendingAlertCapacity = (candleClosesBeforeAlert + 1) * 2
+string GROUP_DRAWINGS = "Drawings"
+bool showHistoricalLines = input.bool(true, "Show historical SMT lines", group=GROUP_DRAWINGS)
+bool showBullishLines = input.bool(true, "Show bullish SMT lines", group=GROUP_DRAWINGS)
+bool showBearishLines = input.bool(true, "Show bearish SMT lines", group=GROUP_DRAWINGS)
+bool showOnlyLatest = input.bool(false, "Show only the latest SMT", group=GROUP_DRAWINGS)
+int maximumHistoricalSignals = input.int(10, "Maximum Historical SMT Signals",
+     options=[10, 20, 30, 50, 100], group=GROUP_DRAWINGS,
+     tooltip="Combined bullish and bearish history. This also selects the 5M source lookback: 900 / 1800 / 2600 / 4200 / 8000 candles for 10 / 20 / 30 / 50 / 100 signals.")
+color bullishColor = input.color(#00E676, "Bullish color", group=GROUP_DRAWINGS)
+color bearishColor = input.color(#FF1744, "Bearish color", group=GROUP_DRAWINGS)
+int lineWidth = input.int(2, "Line width", minval=1, maxval=5, group=GROUP_DRAWINGS)
+int lineTransparency = input.int(0, "Line transparency", minval=0, maxval=100, group=GROUP_DRAWINGS)
+string GROUP_CFD = "CFD session (daily break)"
+string blockSession = input.session("1655-1815", "No-alert window (New York time)", group=GROUP_CFD,
+     tooltip="Pepperstone US index CFDs stop for about an hour every day (17:00-18:00 New York time, around 23:00-00:00 Norway time), and spreads are wide around it. SMT events confirmed inside this window are drawn but never alerted. Uses New York time so it follows US daylight saving automatically.")
+bool resetAcrossBreak = input.bool(true, "Reset swing references across market breaks", group=GROUP_CFD,
+     tooltip="On = when the 5M feed has a gap (daily break, weekend, holiday), all open swing references and unmatched pivots are cleared, so a swing from before the break is never compared with price after it.")
+int gapResetMinutes = input.int(15, "Gap that counts as a break (minutes)", minval=10, maxval=240, group=GROUP_CFD)
+string GROUP_WEBHOOK = "Webhook"
+string webhookSecret = input.string("", "Webhook secret", group=GROUP_WEBHOOK,
+     tooltip="Leave empty (recommended) and put the key in the webhook URL as ?key=... instead. If filled in, it must match WEBHOOK_SECRET on Render.")
+string indicatorId = input.string("SMT_PEPPERSTONE_1M_TEST", "Indicator id", group=GROUP_WEBHOOK)
+string GROUP_DEBUG = "Debug"
+bool debugMode = input.bool(false, "Enable debug mode", group=GROUP_DEBUG)
+int chartSeconds = timeframe.in_seconds()
+string chartTicker = str.upper(syminfo.ticker)
+// Ticker part of an input such as "PEPPERSTONE:NAS100.P" -> "NAS100.P".
+f_tickerOf(string symbolId) =>
+    array<string> parts = str.split(str.upper(symbolId), ":")
+    array.size(parts) > 0 ? array.get(parts, array.size(parts) - 1) : ""
+bool chartIsNAS = chartTicker == f_tickerOf(nasSymbolInput) or str.contains(chartTicker, "NAS100") or str.contains(chartTicker, "US100") or str.contains(chartTicker, "USTEC")
+bool chartIsSPX = chartTicker == f_tickerOf(spxSymbolInput) or str.contains(chartTicker, "US500") or str.contains(chartTicker, "SPX500")
+// The chart leg is always the chart's own symbol. Drawing with prices from a
+// different symbol (e.g. US500.P data on a US500 chart) offsets the lines.
+string nasSymbol = chartIsNAS and not chartIsSPX ? syminfo.prefix + ":" + syminfo.ticker : nasSymbolInput
+string spxSymbol = chartIsSPX and not chartIsNAS ? syminfo.prefix + ":" + syminfo.ticker : spxSymbolInput
+string nasTicker = f_tickerOf(nasSymbol)
+string spxTicker = f_tickerOf(spxSymbol)
+bool supportedChart = (chartIsNAS or chartIsSPX) and not (chartIsNAS and chartIsSPX)
+bool chartIsPepperstone = str.upper(syminfo.prefix) == "PEPPERSTONE"
+bool drawingsVisible = not na(chartSeconds) and chartSeconds <= SOURCE_SECONDS
+bool needBullishEngine = debugMode or (enableAlerts and enableBullishAlerts) or
+     (drawingsVisible and showHistoricalLines and showBullishLines)
+bool needBearishEngine = debugMode or (enableAlerts and enableBearishAlerts) or
+     (drawingsVisible and showHistoricalLines and showBearishLines)
+// Higher chart timeframes consume confirmed 5M intrabars.
+// Drawings remain limited to charts at or below 5 minutes.
+bool canRunEngine = supportedChart and (needBullishEngine or needBearishEngine)
+bool drawUsingNASPrices = chartIsNAS
+if barstate.isfirst and not supportedChart
+    runtime.error("Use this indicator on a PEPPERSTONE:NAS100 or PEPPERSTONE:US500 1-minute chart.")
+if barstate.isfirst and na(chartSeconds)
+    runtime.error("Use this indicator on a time-based chart.")
+//====================================================
+// Trend-bias (24t) for webhook/Telegram-filter
+//====================================================
+string GROUP_BIAS = "Trend bias (24h)"
+float biasThresholdPct = input.float(0.5, "Trend threshold 24h (%)", minval=0.0, maxval=10.0, step=0.1, group=GROUP_BIAS,
+     tooltip="Change over ~24h on NAS100 (hourly bars). Above +threshold = UP, below -threshold = DOWN, otherwise NONE.")
+int biasLookbackBars = input.int(23, "Bias lookback (hourly bars)", minval=1, maxval=200, group=GROUP_BIAS,
+     tooltip="The CFDs trade about 23 hours a day, so 23 hourly bars is roughly 24 hours.")
+string trendMode = input.string("Hide counter-trend", "Trend filter for SMT lines and alerts",
+     options=["Hide counter-trend", "Grey counter-trend", "Off"], group=GROUP_BIAS,
+     tooltip="Hide counter-trend = a bullish SMT in a DOWN trend or a bearish SMT in an UP trend is neither drawn nor alerted. Grey = drawn in grey (alert follows the INFO setting below). SMTs with no trend (NONE) are drawn in grey. Off = everything drawn in normal colors.")
+int trendLookbackBars = input.int(12, "With-trend pullback: swing must be extreme of last N 5M bars", minval=0, maxval=300, group=GROUP_BIAS,
+     tooltip="In an UP trend a swing low (and in a DOWN trend a swing high) is a pullback, so it only has to be the lowest low / highest high of the last N 5M bars (12 = 1 hour) instead of the stricter major-swing setting, and the mid-range filter is skipped. Gives more SMTs in the trend's direction.")
+color greyColor = input.color(color.gray, "Counter-trend / no-trend color", group=GROUP_BIAS)
+bool sendCounterTrend = input.bool(true, "Also alert counter-trend SMT (sent as INFO)", group=GROUP_BIAS,
+     tooltip="Off = bearish SMT in an UP trend and bullish SMT in a DOWN trend (and all SMT with no trend) are not alerted at all.")
+[biasNowPrice, biasRefPrice] = request.security(nasSymbol, "60", [close, close[biasLookbackBars]], lookahead=barmerge.lookahead_off)
+float bias24Pct = not na(biasRefPrice) and biasRefPrice != 0 ? 100.0 * (biasNowPrice - biasRefPrice) / biasRefPrice : na
+string bias24State = na(bias24Pct) ? "NONE" : bias24Pct >= biasThresholdPct ? "UP" : bias24Pct <= -biasThresholdPct ? "DOWN" : "NONE"
+f_biasText() =>
+    string pctText = na(bias24Pct) ? "n/a" : (bias24Pct >= 0 ? "+" : "") + str.tostring(bias24Pct, "#.##") + "%"
+    " | 24t: " + pctText + " | bias=" + bias24State
+varip int realtimeStart = na
+if barstate.isrealtime and na(realtimeStart)
+    realtimeStart := timenow
+//====================================================
+// Types and source helpers
+//====================================================
+type PivotPoint
+    int pivotTime
+    float price
+type SourceBundle
+    float highValue
+    float lowValue
+    float closeValue
+    int sourceTime
+    int sourceClose
+    float tickSize
+    float pivotHigh
+    int pivotHighTime
+    float pivotLow
+    int pivotLowTime
+    float alertPivotHigh
+    int alertPivotHighTime
+    float alertPivotLow
+    int alertPivotLowTime
+    float atrValue
+    // Previous closed 5M candle ([1]) for catch-up of a missed closing execution.
+    float prevHighValue
+    float prevLowValue
+    float prevCloseValue
+    int prevSourceTime
+    int prevSourceClose
+    float prevPivotHigh
+    int prevPivotHighTime
+    float prevPivotLow
+    int prevPivotLowTime
+    float prevAtrValue
+    // Nearest two untaken key levels above the candle high / below the candle low.
+    float magnetAbove1 = na
+    float magnetAbove2 = na
+    float magnetBelow1 = na
+    float magnetBelow2 = na
+    float prevMagnetAbove1 = na
+    float prevMagnetAbove2 = na
+    float prevMagnetBelow1 = na
+    float prevMagnetBelow2 = na
+type PendingSmt
+    string eventId
+    bool bullish
+    string sourceTimeframe
+    int confirmationBarTime
+    float confirmationClose
+    int completedCandlesSinceConfirmation
+    bool alertSent
+    string sweeper = ""
+    float smtLevel = na  // low/high (on the chart symbol) of the candle that formed the SMT
+type SourceCandle
+    int sourceTime
+    int sourceClose
+    float highValue
+    float lowValue
+type DrawSmt
+    bool bullish
+    bool muted
+    int eventId
+    int x1
+    float y1
+    int x2
+    float y2
+type SweepReference
+    int nasTime
+    float nasPrice
+    int spxTime
+    float spxPrice
+    int activationClose
+    bool nasTaken = false
+    bool spxTaken = false
+    bool divergedNow = false
+// Keeps the two nearest levels above (or below) refPrice.
+f_nearest2(float n1, float n2, float level, float refPrice, bool above) =>
+    float best1 = n1
+    float best2 = n2
+    bool valid = not na(level) and not na(refPrice) and (above ? level > refPrice : level < refPrice)
+    if valid
+        if na(best1) or (above ? level < best1 : level > best1)
+            best2 := best1
+            best1 := level
+        else if level != best1 and (na(best2) or (above ? level < best2 : level > best2))
+            best2 := level
+    [best1, best2]
+// This runs inside the explicit symbol/"5" request. No chart timeframe data
+// and no 1-minute data enter the pivot calculation. The host only consumes a
+// source candle after its close timestamp has passed.
+f_sourceBundle(int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
+    float swingHigh = na
+    float swingLow = na
+    float alertSwingHigh = na
+    float alertSwingLow = na
+    int alertLeftBars = math.max(1, alertStrength)
+    if includeHighPivots
+        swingHigh := ta.pivothigh(high, drawingStrength, drawingStrength)
+        alertSwingHigh := ta.pivothigh(high, alertLeftBars, alertStrength)
+    if includeLowPivots
+        swingLow := ta.pivotlow(low, drawingStrength, drawingStrength)
+        alertSwingLow := ta.pivotlow(low, alertLeftBars, alertStrength)
+    // Major swing filter: the pivot must be the extreme of the last N candles
+    // before it (plus its own pivot window).
+    // Trend of this market over ~24h (same idea as the webhook bias): a swing
+    // low in an UP trend (or a swing high in a DOWN trend) is a with-trend
+    // pullback and gets the looser pullback lookback instead.
+    float trendRefClose = close[math.max(1, biasLookbackBars * 60)]
+    float trendPct = not na(trendRefClose) and trendRefClose != 0 ? 100.0 * (close - trendRefClose) / trendRefClose : na
+    bool trendUp = not na(trendPct) and trendPct >= biasThresholdPct
+    bool trendDown = not na(trendPct) and trendPct <= -biasThresholdPct
+    bool lowWithTrend = trendUp and trendMode != "Off"
+    bool highWithTrend = trendDown and trendMode != "Off"
+    float majorLow = ta.lowest(low, drawingStrength + majorLookbackBars + 1)
+    float majorHigh = ta.highest(high, drawingStrength + majorLookbackBars + 1)
+    float pullbackLow = ta.lowest(low, drawingStrength + trendLookbackBars + 1)
+    float pullbackHigh = ta.highest(high, drawingStrength + trendLookbackBars + 1)
+    int lowLookback = lowWithTrend ? trendLookbackBars : majorLookbackBars
+    int highLookback = highWithTrend ? trendLookbackBars : majorLookbackBars
+    if lowLookback > 0 and not na(swingLow) and swingLow > (lowWithTrend ? pullbackLow : majorLow)
+        swingLow := na
+    if highLookback > 0 and not na(swingHigh) and swingHigh < (highWithTrend ? pullbackHigh : majorHigh)
+        swingHigh := na
+    // Not mid-range: the swing must sit near the top (high) or bottom (low)
+    // of the last rangeBars candles.
+    float rangeTop = ta.highest(high, math.max(1, rangeBars))
+    float rangeBottom = ta.lowest(low, math.max(1, rangeBars))
+    float rangeSize = rangeTop - rangeBottom
+    if rangeBars > 0 and rangeEdgePct < 100 and not na(rangeSize) and rangeSize > 0
+        if not highWithTrend and not na(swingHigh) and (swingHigh - rangeBottom) / rangeSize < 1.0 - rangeEdgePct / 100.0
+            swingHigh := na
+        if not lowWithTrend and not na(swingLow) and (rangeTop - swingLow) / rangeSize < 1.0 - rangeEdgePct / 100.0
+            swingLow := na
+    // Key levels on the New York clock. Trading day starts with Asia (18:00 NY).
+    int nyMinute = hour(time, "America/New_York") * 60 + minute(time, "America/New_York")
+    int sessionNow = nyMinute >= 18 * 60 or nyMinute < 2 * 60 ? 0 : nyMinute < 8 * 60 + 30 ? 1 : 2
+    var int sessionId = -1
+    var float sessHigh = na
+    var float sessLow = na
+    var float dayHigh = na
+    var float dayLow = na
+    var float pdHigh = na
+    var float pdLow = na
+    var float asiaHigh = na
+    var float asiaLow = na
+    var float lonHigh = na
+    var float lonLow = na
+    var float nyHigh = na
+    var float nyLow = na
+    if sessionNow != sessionId
+        if sessionId == 0
+            asiaHigh := sessHigh
+            asiaLow := sessLow
+        else if sessionId == 1
+            lonHigh := sessHigh
+            lonLow := sessLow
+        else if sessionId == 2
+            nyHigh := sessHigh
+            nyLow := sessLow
+        if sessionNow == 0
+            pdHigh := dayHigh
+            pdLow := dayLow
+            dayHigh := na
+            dayLow := na
+        sessionId := sessionNow
+        sessHigh := na
+        sessLow := na
+    // A completed level that price trades through is taken and no longer a magnet.
+    if not na(pdHigh) and high > pdHigh
+        pdHigh := na
+    if not na(pdLow) and low < pdLow
+        pdLow := na
+    if not na(asiaHigh) and high > asiaHigh
+        asiaHigh := na
+    if not na(asiaLow) and low < asiaLow
+        asiaLow := na
+    if not na(lonHigh) and high > lonHigh
+        lonHigh := na
+    if not na(lonLow) and low < lonLow
+        lonLow := na
+    if not na(nyHigh) and high > nyHigh
+        nyHigh := na
+    if not na(nyLow) and low < nyLow
+        nyLow := na
+    // Running session / day extremes from earlier candles count only if above
+    // (below) this candle, so they are checked before this candle is added.
+    float magA1 = na
+    float magA2 = na
+    float magB1 = na
+    float magB2 = na
+    [a1, a2] = f_nearest2(magA1, magA2, pdHigh, high, true)
+    [a3, a4] = f_nearest2(a1, a2, asiaHigh, high, true)
+    [a5, a6] = f_nearest2(a3, a4, lonHigh, high, true)
+    [a7, a8] = f_nearest2(a5, a6, nyHigh, high, true)
+    [a9, a10] = f_nearest2(a7, a8, sessHigh, high, true)
+    [a11, a12] = f_nearest2(a9, a10, dayHigh, high, true)
+    [b1, b2] = f_nearest2(magB1, magB2, pdLow, low, false)
+    [b3, b4] = f_nearest2(b1, b2, asiaLow, low, false)
+    [b5, b6] = f_nearest2(b3, b4, lonLow, low, false)
+    [b7, b8] = f_nearest2(b5, b6, nyLow, low, false)
+    [b9, b10] = f_nearest2(b7, b8, sessLow, low, false)
+    [b11, b12] = f_nearest2(b9, b10, dayLow, low, false)
+    sessHigh := na(sessHigh) ? high : math.max(sessHigh, high)
+    sessLow := na(sessLow) ? low : math.min(sessLow, low)
+    dayHigh := na(dayHigh) ? high : math.max(dayHigh, high)
+    dayLow := na(dayLow) ? low : math.min(dayLow, low)
+    int swingHighTime = not na(swingHigh) ? time[drawingStrength] : na
+    int swingLowTime = not na(swingLow) ? time[drawingStrength] : na
+    int alertSwingHighTime = not na(alertSwingHigh) ? time[alertStrength] : na
+    int alertSwingLowTime = not na(alertSwingLow) ? time[alertStrength] : na
+    float bundleHigh = high
+    float bundleLow = low
+    float atrValue = ta.atr(14)
+    SourceBundle.new(bundleHigh, bundleLow,
+         close, time, time_close, syminfo.mintick,
+         swingHigh, swingHighTime, swingLow, swingLowTime, alertSwingHigh, alertSwingHighTime, alertSwingLow, alertSwingLowTime, atrValue,
+         bundleHigh[1], bundleLow[1], close[1], time[1], time_close[1],
+         swingHigh[1], swingHighTime[1], swingLow[1], swingLowTime[1], atrValue[1],
+         a11, a12, b11, b12, a11[1], a12[1], b11[1], b12[1])
+// calc_bars_count is a compile-time constant in Pine. These small wrappers let
+// the user-selected signal cap choose a matching, bounded 5M history window.
+f_request900(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
+    request.security(tickerId, "1", f_sourceBundle(drawingStrength, alertStrength, includeHighPivots, includeLowPivots), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, calc_bars_count=2000)
+f_request1800(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
+    request.security(tickerId, "1", f_sourceBundle(drawingStrength, alertStrength, includeHighPivots, includeLowPivots), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, calc_bars_count=3000)
+f_request2600(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
+    request.security(tickerId, "1", f_sourceBundle(drawingStrength, alertStrength, includeHighPivots, includeLowPivots), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, calc_bars_count=4000)
+f_request4200(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
+    request.security(tickerId, "1", f_sourceBundle(drawingStrength, alertStrength, includeHighPivots, includeLowPivots), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, calc_bars_count=4200)
+f_request8000(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
+    request.security(tickerId, "1", f_sourceBundle(drawingStrength, alertStrength, includeHighPivots, includeLowPivots), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, calc_bars_count=8000)
+f_requestLower900(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
+    request.security_lower_tf(tickerId, "1", f_sourceBundle(drawingStrength, alertStrength, includeHighPivots, includeLowPivots), ignore_invalid_timeframe=false, calc_bars_count=2000)
+f_requestLower1800(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
+    request.security_lower_tf(tickerId, "1", f_sourceBundle(drawingStrength, alertStrength, includeHighPivots, includeLowPivots), ignore_invalid_timeframe=false, calc_bars_count=3000)
+f_requestLower2600(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
+    request.security_lower_tf(tickerId, "1", f_sourceBundle(drawingStrength, alertStrength, includeHighPivots, includeLowPivots), ignore_invalid_timeframe=false, calc_bars_count=4000)
+f_requestLower4200(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
+    request.security_lower_tf(tickerId, "1", f_sourceBundle(drawingStrength, alertStrength, includeHighPivots, includeLowPivots), ignore_invalid_timeframe=false, calc_bars_count=4200)
+f_requestLower8000(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
+    request.security_lower_tf(tickerId, "1", f_sourceBundle(drawingStrength, alertStrength, includeHighPivots, includeLowPivots), ignore_invalid_timeframe=false, calc_bars_count=8000)
+f_pushPivot(array<PivotPoint> queue, float price, int pivotTime, int capacity) =>
+    if not na(price) and not na(pivotTime)
+        array.push(queue, PivotPoint.new(pivotTime, price))
+        while array.size(queue) > capacity
+            array.shift(queue)
+    true
+f_pushSourceCandle(array<SourceCandle> candles, SourceCandle candle, int capacity) =>
+    array.push(candles, candle)
+    while array.size(candles) > capacity
+        array.shift(candles)
+    true
+// Reject the SMT if the straight line between the confirmed wick pivots
+// intersects any intervening source candle range on this instrument.
+f_segmentClear(array<SourceCandle> candles, int startTime, float startPrice,
+     int endTime, float endPrice, bool highSegment) =>
+    bool clear = not na(startTime) and not na(endTime) and not na(startPrice) and
+         not na(endPrice) and endTime > startTime and array.size(candles) > 0
+    int count = array.size(candles)
+    if clear
+        SourceCandle oldest = array.get(candles, 0)
+        SourceCandle newest = array.get(candles, count - 1)
+        if oldest.sourceTime > startTime or newest.sourceTime < endTime
+            clear := false
+    bool startEndpointFound = false
+    bool endEndpointFound = false
+    int index = 0
+    while clear and index < count
+        SourceCandle candle = array.get(candles, index)
+        if candle.sourceTime > endTime
+            index := count
+        else
+            if candle.sourceTime == startTime
+                startEndpointFound := highSegment ? candle.highValue == startPrice : candle.lowValue == startPrice
+            if candle.sourceTime == endTime
+                endEndpointFound := highSegment ? candle.highValue == endPrice : candle.lowValue == endPrice
+            if candle.sourceTime > startTime and candle.sourceTime < endTime
+                if candle.sourceClose > endTime
+                    clear := false
+                else
+                    float fractionOpen = float(candle.sourceTime - startTime) / float(endTime - startTime)
+                    float fractionClose = float(candle.sourceClose - startTime) / float(endTime - startTime)
+                    float lineAtOpen = startPrice + (endPrice - startPrice) * fractionOpen
+                    float lineAtClose = startPrice + (endPrice - startPrice) * fractionClose
+                    float segmentFloor = math.min(lineAtOpen, lineAtClose)
+                    float segmentCeiling = math.max(lineAtOpen, lineAtClose)
+                    if highSegment and candle.highValue >= segmentFloor
+                        clear := false
+                    if not highSegment and candle.lowValue <= segmentCeiling
+                        clear := false
+        index += 1
+    clear and startEndpointFound and endEndpointFound
+f_debugTime(int sourceTime) =>
+    na(sourceTime) ? "na" : str.format_time(sourceTime, "MM-dd HH:mm", "Europe/Oslo")
+// FIFO, one-to-one time matching. The queues are bounded to 32 pivots and this
+// function runs only once for a newly closed, synchronized 5M candle.
+f_takeMatchedPivot(array<PivotPoint> nasQueue, array<PivotPoint> spxQueue,
+     int toleranceMs, int nowTime, int maxQueueAgeMs) =>
+    bool matched = false
+    int nasTime = na
+    float nasPrice = na
+    int spxTime = na
+    float spxPrice = na
+    int comparedNASTime = na
+    int comparedSPXTime = na
+    bool searching = true
+    while searching
+        int nasCount = array.size(nasQueue)
+        int spxCount = array.size(spxQueue)
+        if nasCount > 0 and spxCount > 0
+            PivotPoint nasPivot = array.get(nasQueue, 0)
+            PivotPoint spxPivot = array.get(spxQueue, 0)
+            comparedNASTime := nasPivot.pivotTime
+            comparedSPXTime := spxPivot.pivotTime
+            if math.abs(nasPivot.pivotTime - spxPivot.pivotTime) <= toleranceMs
+                nasPivot := array.shift(nasQueue)
+                spxPivot := array.shift(spxQueue)
+                nasTime := nasPivot.pivotTime
+                nasPrice := nasPivot.price
+                spxTime := spxPivot.pivotTime
+                spxPrice := spxPivot.price
+                matched := true
+                searching := false
+            else if nasPivot.pivotTime < spxPivot.pivotTime
+                array.shift(nasQueue)
+            else
+                array.shift(spxQueue)
+        else
+            bool removedOld = false
+            if nasCount > 0
+                PivotPoint oldestNAS = array.get(nasQueue, 0)
+                if not na(nowTime) and nowTime > oldestNAS.pivotTime + maxQueueAgeMs
+                    array.shift(nasQueue)
+                    removedOld := true
+            if spxCount > 0
+                PivotPoint oldestSPX = array.get(spxQueue, 0)
+                if not na(nowTime) and nowTime > oldestSPX.pivotTime + maxQueueAgeMs
+                    array.shift(spxQueue)
+                    removedOld := true
+            if not removedOld
+                searching := false
+    [matched, nasTime, nasPrice, spxTime, spxPrice, comparedNASTime, comparedSPXTime]
+// Builds the previous closed 5M candle from the [1] fields of a requested bundle.
+// It lets the host catch up a closed source candle whose closing execution was
+// missed. lastSourceClose still guarantees each candle is processed only once.
+f_previousBundle(SourceBundle source) =>
+    SourceBundle previous = na
+    if not na(source)
+        if not na(source.prevSourceTime) and not na(source.prevSourceClose)
+            previous := SourceBundle.new(highValue=source.prevHighValue, lowValue=source.prevLowValue,
+                 closeValue=source.prevCloseValue, sourceTime=source.prevSourceTime, sourceClose=source.prevSourceClose,
+                 tickSize=source.tickSize, pivotHigh=source.prevPivotHigh, pivotHighTime=source.prevPivotHighTime,
+                 pivotLow=source.prevPivotLow, pivotLowTime=source.prevPivotLowTime, atrValue=source.prevAtrValue,
+                 magnetAbove1=source.prevMagnetAbove1, magnetAbove2=source.prevMagnetAbove2,
+                 magnetBelow1=source.prevMagnetBelow1, magnetBelow2=source.prevMagnetBelow2)
+    previous
+// Most extreme high (highSide) or low after afterTime, earliest candle on ties.
+f_extremeAfter(array<SourceCandle> candles, int afterTime, bool highSide) =>
+    int bestTime = na
+    float bestPrice = na
+    int index = 0
+    while index < array.size(candles)
+        SourceCandle candle = array.get(candles, index)
+        if candle.sourceTime > afterTime
+            float price = highSide ? candle.highValue : candle.lowValue
+            if not na(price) and (na(bestPrice) or (highSide ? price > bestPrice : price < bestPrice))
+                bestPrice := price
+                bestTime := candle.sourceTime
+        index += 1
+    [bestTime, bestPrice]
+// High or low of the stored source candle that opened at atTime.
+f_candlePrice(array<SourceCandle> candles, int atTime, bool highSide) =>
+    float price = na
+    int index = array.size(candles) - 1
+    while index >= 0
+        SourceCandle candle = array.get(candles, index)
+        if candle.sourceTime == atTime
+            price := highSide ? candle.highValue : candle.lowValue
+            index := -1
+        else if candle.sourceTime < atTime
+            index := -1
+        else
+            index -= 1
+    price
+// Registers a matched, confirmed pivot pair as an active sweep reference.
+// Taken flags include every closed candle after each market's own pivot up to
+// and including the activation candle, so a sweep that happened before the
+// pair could be confirmed is evaluated on the activation candle.
+f_registerReference(array<SweepReference> refs, array<SourceCandle> nasCandles, array<SourceCandle> spxCandles,
+     bool highSide, int nasPivotTime, float nasPivotPrice, int spxPivotTime, float spxPivotPrice,
+     int activationClose, int capacity) =>
+    [nasExtTime, nasExtPrice] = f_extremeAfter(nasCandles, nasPivotTime, highSide)
+    [spxExtTime, spxExtPrice] = f_extremeAfter(spxCandles, spxPivotTime, highSide)
+    bool nasTaken = not na(nasExtPrice) and (highSide ? nasExtPrice > nasPivotPrice : nasExtPrice < nasPivotPrice)
+    bool spxTaken = not na(spxExtPrice) and (highSide ? spxExtPrice > spxPivotPrice : spxExtPrice < spxPivotPrice)
+    bool registered = false
+    if not na(nasPivotTime) and not na(spxPivotTime) and not na(nasPivotPrice) and not na(spxPivotPrice) and not (nasTaken and spxTaken)
+        array.push(refs, SweepReference.new(nasPivotTime, nasPivotPrice, spxPivotTime, spxPivotPrice,
+             activationClose, nasTaken, spxTaken, false))
+        registered := true
+        while array.size(refs) > capacity
+            array.shift(refs)
+    registered
+// Evaluates every active reference of one direction against one closed,
+// synchronized 5M candle. Returns at most one validated SMT event. When an event
+// is confirmed, every reference that diverged on this candle is consumed so the
+// same move cannot create duplicate lines or alerts. References that diverged
+// but failed a filter stay active and can confirm on a later candle.
+f_evaluateSweeps(array<SweepReference> refs, array<SourceCandle> nasCandles, array<SourceCandle> spxCandles,
+     bool highSide, int candleTime, int candleClose,
+     float nasExtreme, float spxExtreme, float nasATR, float spxATR, float nasTick, float spxTick,
+     int maxReferenceAgeMs, float nasMagnet1, float nasMagnet2) =>
+    bool found = false
+    float bestRank = na
+    int bestRefNASTime = na
+    float bestRefNASPrice = na
+    int bestRefSPXTime = na
+    float bestRefSPXPrice = na
+    int bestSweepTime = na
+    float bestEndNASPrice = na
+    float bestEndSPXPrice = na
+    bool bestNASSwept = false
+    int divergedCount = 0
+    string reason = "no active reference swept"
+    int index = 0
+    while index < array.size(refs)
+        SweepReference activeRef = array.get(refs, index)
+        activeRef.divergedNow := false
+        bool removeRef = false
+        if na(candleTime) or candleTime - math.max(activeRef.nasTime, activeRef.spxTime) > maxReferenceAgeMs
+            removeRef := true
+        else
+            bool candidate = false
+            bool nasSweeper = false
+            int sweepTime = na
+            if activeRef.activationClose == candleClose
+                // Activation candle: taken flags were computed at registration and
+                // already include this candle.
+                if activeRef.nasTaken and activeRef.spxTaken
+                    removeRef := true
+                else if activeRef.nasTaken or activeRef.spxTaken
+                    nasSweeper := activeRef.nasTaken
+                    [extTime, extPrice] = f_extremeAfter(nasSweeper ? nasCandles : spxCandles,
+                         nasSweeper ? activeRef.nasTime : activeRef.spxTime, highSide)
+                    sweepTime := extTime
+                    candidate := not na(extTime)
+            else
+                bool nasNow = not na(nasExtreme) and (highSide ? nasExtreme > activeRef.nasPrice : nasExtreme < activeRef.nasPrice)
+                bool spxNow = not na(spxExtreme) and (highSide ? spxExtreme > activeRef.spxPrice : spxExtreme < activeRef.spxPrice)
+                activeRef.nasTaken := activeRef.nasTaken or nasNow
+                activeRef.spxTaken := activeRef.spxTaken or spxNow
+                if activeRef.nasTaken and activeRef.spxTaken
+                    // Both markets have taken the level: no divergence is possible.
+                    removeRef := true
+                else if nasNow or spxNow
+                    nasSweeper := nasNow
+                    sweepTime := candleTime
+                    candidate := true
+            if candidate
+                activeRef.divergedNow := true
+                divergedCount += 1
+                float nasEnd = f_candlePrice(nasCandles, sweepTime, highSide)
+                float spxEnd = f_candlePrice(spxCandles, sweepTime, highSide)
+                bool endpointsKnown = not na(nasEnd) and not na(spxEnd)
+                float sweepRef = nasSweeper ? activeRef.nasPrice : activeRef.spxPrice
+                float sweepEnd = nasSweeper ? nasEnd : spxEnd
+                float heldRef = nasSweeper ? activeRef.spxPrice : activeRef.nasPrice
+                float heldEnd = nasSweeper ? spxEnd : nasEnd
+                float sweepDistance = highSide ? sweepEnd - sweepRef : sweepRef - sweepEnd
+                float heldDistance = highSide ? heldRef - heldEnd : heldEnd - heldRef
+                bool segmentClear = endpointsKnown and
+                     f_segmentClear(nasCandles, activeRef.nasTime, activeRef.nasPrice, sweepTime, nasEnd, highSide) and
+                     f_segmentClear(spxCandles, activeRef.spxTime, activeRef.spxPrice, sweepTime, spxEnd, highSide)
+                float sweepATR = nasSweeper ? nasATR : spxATR
+                float heldATR = nasSweeper ? spxATR : nasATR
+                float sweepTick = nasSweeper ? nasTick : spxTick
+                float strengthPct = endpointsKnown and not na(sweepATR) and sweepATR > 0 and not na(heldATR) and heldATR > 0 ?
+                     math.min(100.0, 50.0 * (sweepDistance / sweepATR + heldDistance / heldATR)) : na
+                bool tickPass = endpointsKnown and not na(sweepTick) and sweepTick > 0 and sweepDistance / sweepTick >= minimumDivergenceTicks
+                bool percentPass = endpointsKnown
+                if endpointsKnown and useMinimumPercentDifference
+                    float nasMovePct = highSide ? 100.0 * (nasEnd - activeRef.nasPrice) / activeRef.nasPrice : 100.0 * (activeRef.nasPrice - nasEnd) / activeRef.nasPrice
+                    float spxMovePct = highSide ? 100.0 * (spxEnd - activeRef.spxPrice) / activeRef.spxPrice : 100.0 * (activeRef.spxPrice - spxEnd) / activeRef.spxPrice
+                    percentPass := math.abs(nasMovePct - spxMovePct) >= minimumPercentDifference
+                bool strengthPass = not na(strengthPct) and strengthPct >= minimumStrength
+                // Major swing filter: price must have left the level by at least
+                // minSwingATR x ATR between the swing and the sweep.
+                bool swingPass = true
+                if minSwingATR > 0
+                    [awayTime, awayPrice] = f_extremeAfter(nasSweeper ? nasCandles : spxCandles,
+                         nasSweeper ? activeRef.nasTime : activeRef.spxTime, not highSide)
+                    float awayDistance = highSide ? sweepRef - awayPrice : awayPrice - sweepRef
+                    swingPass := not na(awayDistance) and not na(sweepATR) and sweepATR > 0 and awayDistance >= minSwingATR * sweepATR
+                // Key-level check on NAS100 (the traded market): skip the SMT if an
+                // untaken key level sits just beyond it. Levels at the NAS swing
+                // itself (e.g. it is the session high) are part of the SMT, not a magnet.
+                bool magnetPass = true
+                if magnetATR > 0 and endpointsKnown and not na(nasATR) and nasATR > 0
+                    float barrier = highSide ? math.max(nasEnd, activeRef.nasPrice) : math.min(nasEnd, activeRef.nasPrice)
+                    float eps = 0.1 * nasATR
+                    float magnet = na
+                    if not na(nasMagnet1) and (highSide ? nasMagnet1 > barrier + eps : nasMagnet1 < barrier - eps)
+                        magnet := nasMagnet1
+                    else if not na(nasMagnet2) and (highSide ? nasMagnet2 > barrier + eps : nasMagnet2 < barrier - eps)
+                        magnet := nasMagnet2
+                    if not na(magnet)
+                        magnetPass := math.abs(magnet - barrier) >= magnetATR * nasATR
+                if segmentClear and tickPass and percentPass and strengthPass and swingPass and magnetPass
+                    // Most extreme reference wins: highest high / lowest low.
+                    float rank = activeRef.nasPrice
+                    if not found or (highSide ? rank > bestRank : rank < bestRank)
+                        found := true
+                        bestRank := rank
+                        bestRefNASTime := activeRef.nasTime
+                        bestRefNASPrice := activeRef.nasPrice
+                        bestRefSPXTime := activeRef.spxTime
+                        bestRefSPXPrice := activeRef.spxPrice
+                        bestSweepTime := sweepTime
+                        bestEndNASPrice := nasEnd
+                        bestEndSPXPrice := spxEnd
+                        bestNASSwept := nasSweeper
+                else if not found
+                    reason := not endpointsKnown ? "source candle history incomplete" :
+                         not segmentClear ? "segment crosses an intermediate 5M candle on NAS or SPX" :
+                         not tickPass ? "divergence ticks below minimum" :
+                         not percentPass ? "percent filter" : not strengthPass ? "strength below minimum" :
+                         not swingPass ? "not a major swing (too small move away)" : "untaken key level just beyond the SMT"
+        if removeRef
+            array.remove(refs, index)
+        else
+            index += 1
+    if found
+        int removeIndex = array.size(refs) - 1
+        while removeIndex >= 0
+            SweepReference consumed = array.get(refs, removeIndex)
+            if consumed.divergedNow
+                array.remove(refs, removeIndex)
+            removeIndex -= 1
+        reason := "confirmed"
+    [found, bestRefNASTime, bestRefNASPrice, bestRefSPXTime, bestRefSPXPrice, bestSweepTime,
+         bestEndNASPrice, bestEndSPXPrice, bestNASSwept, divergedCount, reason]
+f_sendAlert(array<string> keys, bool active, bool allowed, string eventKey,
+     int eventSourceClose, int firedAt, string message) =>
+    bool sent = false
+    if active and allowed and not array.includes(keys, eventKey) and barstate.isrealtime and not na(realtimeStart) and
+         not na(eventSourceClose) and not na(firedAt) and eventSourceClose > realtimeStart and
+         firedAt > realtimeStart
+        alert(message, alert.freq_all)
+        array.push(keys, eventKey)
+        sent := true
+        while array.size(keys) > 256
+            array.shift(keys)
+    sent
+// Parses "HHMM-HHMM" and checks a timestamp in New York time. Handles windows
+// that wrap past midnight.
+f_inBlockWindow(int ts) =>
+    bool inside = false
+    if not na(ts) and str.length(blockSession) >= 9
+        int startMin = int(str.tonumber(str.substring(blockSession, 0, 2))) * 60 + int(str.tonumber(str.substring(blockSession, 2, 4)))
+        int endMin = int(str.tonumber(str.substring(blockSession, 5, 7))) * 60 + int(str.tonumber(str.substring(blockSession, 7, 9)))
+        int nowMin = hour(ts, "America/New_York") * 60 + minute(ts, "America/New_York")
+        inside := startMin <= endMin ? nowMin >= startMin and nowMin < endMin : nowMin >= startMin or nowMin < endMin
+    inside
+// JSON body for the smt-bot webhook (app/signals.py reads instrument, indicator,
+// signal, price, timeframe and time; trend_aligned=false makes the Telegram
+// message info-only; change_24h_pct and bias are shown in Telegram; the rest is kept in `raw`).
+f_alertJson(PendingSmt pending, bool trendAligned) =>
+    string q = "\""
+    string pctText = na(bias24Pct) ? "null" : str.tostring(bias24Pct, "0.00")
+    "{" +
+         (webhookSecret == "" ? "" : q + "secret" + q + ":" + q + webhookSecret + q + ",") +
+         q + "indicator" + q + ":" + q + indicatorId + q + "," +
+         q + "broker" + q + ":" + q + "PEPPERSTONE" + q + "," +
+         q + "instrument" + q + ":" + q + syminfo.ticker + q + "," +
+         q + "pair" + q + ":" + q + nasTicker + "/" + spxTicker + q + "," +
+         q + "signal" + q + ":" + q + (pending.bullish ? "BUY" : "SELL") + q + "," +
+         q + "price" + q + ":" + str.tostring(pending.confirmationClose, format.mintick) + "," +
+         q + "timeframe" + q + ":" + q + "1" + q + "," +
+         q + "time" + q + ":" + q + str.format_time(pending.confirmationBarTime, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC") + q + "," +
+         q + "sweeper" + q + ":" + q + pending.sweeper + q + "," +
+         q + "bias" + q + ":" + q + bias24State + q + "," +
+         q + "change_24h_pct" + q + ":" + pctText + "," +
+         q + "trend_aligned" + q + ":" + (trendAligned ? "true" : "false") + "," +
+         q + "smt_level" + q + ":" + (na(pending.smtLevel) ? "null" : str.tostring(pending.smtLevel, format.mintick)) + "," +
+         q + "event_id" + q + ":" + q + pending.eventId + q +
+         "}"
+// Called exactly once per closed, synchronized 5M source candle. The candle that
+// confirms the SMT leaves the counter at 0; every later closed 5M candle adds 1.
+// Delay 0 = close of the confirming candle, 1 = close of the next 5M candle, etc.
+// An event is removed from the queue only when it is due.
+f_processPendingAlerts(array<PendingSmt> queue, array<string> sentKeys,
+     int sourceCloseTime, int requiredCandles,
+     bool alertsEnabled, bool bullishEnabled, bool bearishEnabled) =>
+    int index = 0
+    while index < array.size(queue)
+        PendingSmt pending = array.get(queue, index)
+        if sourceCloseTime > pending.confirmationBarTime
+            pending.completedCandlesSinceConfirmation := pending.completedCandlesSinceConfirmation + 1
+        bool directionEnabled = pending.bullish ? bullishEnabled : bearishEnabled
+        if pending.sourceTimeframe == "1" and pending.completedCandlesSinceConfirmation >= requiredCandles
+            bool trendAligned = pending.bullish ? bias24State == "UP" : bias24State == "DOWN"
+            bool inBreakWindow = f_inBlockWindow(pending.confirmationBarTime)
+            if not pending.alertSent and alertsEnabled and directionEnabled and (trendAligned or sendCounterTrend) and not inBreakWindow
+                string message = f_alertJson(pending, trendAligned)
+                bool sent = f_sendAlert(sentKeys, true, alertsEnabled and directionEnabled,
+                     pending.eventId, pending.confirmationBarTime, sourceCloseTime, message)
+                pending.alertSent := sent
+            array.remove(queue, index)
+        else
+            index += 1
+    true
+f_recordDraw(array<DrawSmt> historyQueue, array<DrawSmt> realtimeQueue,
+     DrawSmt drawing, int limit, bool latestOnly, bool isHistorical) =>
+    if isHistorical
+        if latestOnly
+            array.clear(historyQueue)
+        array.push(historyQueue, drawing)
+        while array.size(historyQueue) > limit
+            array.shift(historyQueue)
+    else
+        array.push(realtimeQueue, drawing)
+        while array.size(realtimeQueue) > limit
+            array.shift(realtimeQueue)
+    true
+f_renderDraw(DrawSmt drawing, array<line> lines, array<string> keys,
+     int limit, bool latestOnly, bool showLines, color bullColor, color bearColor,
+     int transparency, int width) =>
+    string key = (drawing.bullish ? "B:" : "S:") + str.tostring(drawing.eventId)
+    if showLines and not array.includes(keys, key) and drawing.x2 > drawing.x1
+        if latestOnly
+            while array.size(lines) > 0
+                line.delete(array.shift(lines))
+        color baseColor = drawing.muted ? greyColor : drawing.bullish ? bullColor : bearColor
+        line id = line.new(x1=drawing.x1, y1=drawing.y1, x2=drawing.x2, y2=drawing.y2,
+             xloc=xloc.bar_time, extend=extend.none, color=color.new(baseColor, transparency), width=width)
+        array.push(lines, id)
+        array.push(keys, key)
+        while array.size(lines) > limit
+            line.delete(array.shift(lines))
+        while array.size(keys) > limit
+            array.shift(keys)
+    true
+//====================================================
+// Persistent 5M-only state
+//====================================================
+varip int lastSourceClose = na
+// Open time of the first 5M candle after the latest feed gap (daily break / weekend).
+varip int lastBreakTime = na
+varip int breakResetCount = 0
+varip int lastNASHighPivotTime = na
+varip int lastSPXHighPivotTime = na
+varip int lastNASLowPivotTime = na
+varip int lastSPXLowPivotTime = na
+varip array<PivotPoint> nasHighQueue = array.new<PivotPoint>()
+varip array<PivotPoint> spxHighQueue = array.new<PivotPoint>()
+varip array<PivotPoint> nasLowQueue = array.new<PivotPoint>()
+varip array<PivotPoint> spxLowQueue = array.new<PivotPoint>()
+// Alert pivots have independent queues and swing references. Changing their
+// strength cannot alter the drawing engine's matched pivots or line geometry.
+varip int lastAlertNASHighPivotTime = na
+varip int lastAlertSPXHighPivotTime = na
+varip int lastAlertNASLowPivotTime = na
+varip int lastAlertSPXLowPivotTime = na
+varip array<PivotPoint> alertNASHighQueue = array.new<PivotPoint>()
+varip array<PivotPoint> alertSPXHighQueue = array.new<PivotPoint>()
+varip array<PivotPoint> alertNASLowQueue = array.new<PivotPoint>()
+varip array<PivotPoint> alertSPXLowQueue = array.new<PivotPoint>()
+varip int alertReferenceNASHighTime = na
+varip float alertReferenceNASHigh = na
+varip int alertReferenceSPXHighTime = na
+varip float alertReferenceSPXHigh = na
+varip int alertReferenceNASLowTime = na
+varip float alertReferenceNASLow = na
+varip int alertReferenceSPXLowTime = na
+varip float alertReferenceSPXLow = na
+varip array<string> alertProcessedKeys = array.new_string()
+varip array<SourceCandle> nasSourceCandles = array.new<SourceCandle>()
+varip array<SourceCandle> spxSourceCandles = array.new<SourceCandle>()
+// Keep alert-segment history independent so Alert Pivot cannot change the
+// drawing engine's candle arrays or retention window.
+varip array<SourceCandle> alertNASSourceCandles = array.new<SourceCandle>()
+varip array<SourceCandle> alertSPXSourceCandles = array.new<SourceCandle>()
+// A source bar can confirm one high and one low event. Keep enough entries for
+// both directions across the maximum configured 20 source-candle delay.
+varip array<PendingSmt> pendingAlerts = array.new<PendingSmt>()
+varip array<DrawSmt> pendingDraws = array.new<DrawSmt>()
+var array<DrawSmt> historicalDraws = array.new<DrawSmt>()
+// Active sweep references: matched, confirmed pivot pairs that have not been
+// taken by both markets and have not yet produced an SMT event.
+varip array<SweepReference> activeHighReferences = array.new<SweepReference>()
+varip array<SweepReference> activeLowReferences = array.new<SweepReference>()
+varip array<string> alertedKeys = array.new_string()
+varip array<string> processedEventKeys = array.new_string()
+var array<string> drawnKeys = array.new_string()
+var array<line> smtLines = array.new<line>()
+varip int nasPivotCount = 0
+varip int spxPivotCount = 0
+varip int matchedHighCount = 0
+varip int matchedLowCount = 0
+varip int bullishSignalCount = 0
+varip int bearishSignalCount = 0
+varip int lastDebugSourceClose = na
+varip string debugHighPair = "waiting for confirmed pivots"
+varip string debugHighSync = "not evaluated"
+varip string debugLowPair = "waiting for confirmed pivots"
+varip string debugLowSync = "not evaluated"
+varip string debugSignalStatus = "no confirmed pair evaluated"
+varip string debugAlertStatus = "no alert event"
+varip string debugAlertReason = "no alert triggered"
+//====================================================
+// Two 5M source requests per execution. The selected request budget bounds the
+// historical window; all stateful work is gated to a new closed source bar.
+//====================================================
+if canRunEngine
+    array<SourceBundle> nasBars = array.new<SourceBundle>()
+    array<SourceBundle> spxBars = array.new<SourceBundle>()
+    if chartSeconds <= SOURCE_SECONDS
+        SourceBundle nasSingle = na
+        SourceBundle spxSingle = na
+        if maximumHistoricalSignals == 10
+            nasSingle := f_request900(nasSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+            spxSingle := f_request900(spxSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+        else if maximumHistoricalSignals == 20
+            nasSingle := f_request1800(nasSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+            spxSingle := f_request1800(spxSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+        else if maximumHistoricalSignals == 30
+            nasSingle := f_request2600(nasSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+            spxSingle := f_request2600(spxSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+        else if maximumHistoricalSignals == 50
+            nasSingle := f_request4200(nasSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+            spxSingle := f_request4200(spxSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+        else
+            nasSingle := f_request8000(nasSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+            spxSingle := f_request8000(spxSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+        // Previous closed candle first, then the current one. Both pass through the
+        // same newSourceBar gate, so a candle is never processed twice.
+        if not na(nasSingle) and not na(spxSingle)
+            SourceBundle nasPrevious = f_previousBundle(nasSingle)
+            SourceBundle spxPrevious = f_previousBundle(spxSingle)
+            if not na(nasPrevious) and not na(spxPrevious)
+                array.push(nasBars, nasPrevious)
+                array.push(spxBars, spxPrevious)
+        if not na(nasSingle)
+            array.push(nasBars, nasSingle)
+        if not na(spxSingle)
+            array.push(spxBars, spxSingle)
+    else if maximumHistoricalSignals == 10
+        nasBars := f_requestLower900(nasSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+        spxBars := f_requestLower900(spxSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+    else if maximumHistoricalSignals == 20
+        nasBars := f_requestLower1800(nasSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+        spxBars := f_requestLower1800(spxSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+    else if maximumHistoricalSignals == 30
+        nasBars := f_requestLower2600(nasSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+        spxBars := f_requestLower2600(spxSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+    else if maximumHistoricalSignals == 50
+        nasBars := f_requestLower4200(nasSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+        spxBars := f_requestLower4200(spxSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+    else
+        nasBars := f_requestLower8000(nasSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+        spxBars := f_requestLower8000(spxSymbol, drawingPivotStrength, alertPivotStrength, needBearishEngine, needBullishEngine)
+    int nasIndex = 0
+    int spxIndex = 0
+    while nasIndex < array.size(nasBars) and spxIndex < array.size(spxBars)
+        SourceBundle nasSource = array.get(nasBars, nasIndex)
+        SourceBundle spxSource = array.get(spxBars, spxIndex)
+        if na(nasSource) or na(spxSource)
+            nasIndex += 1
+            spxIndex += 1
+        else if nasSource.sourceTime == spxSource.sourceTime and nasSource.sourceClose == spxSource.sourceClose
+            float nasHigh = nasSource.highValue
+            float nasLow = nasSource.lowValue
+            float nasClosePrice = nasSource.closeValue
+            int nasTime = nasSource.sourceTime
+            int nasClose = nasSource.sourceClose
+            float nasTick = nasSource.tickSize
+            float nasHighPivot = nasSource.pivotHigh
+            int nasHighPivotTime = nasSource.pivotHighTime
+            float nasLowPivot = nasSource.pivotLow
+            int nasLowPivotTime = nasSource.pivotLowTime
+            float nasATR = nasSource.atrValue
+            float spxHigh = spxSource.highValue
+            float spxLow = spxSource.lowValue
+            float spxClosePrice = spxSource.closeValue
+            float chartConfirmationClose = drawUsingNASPrices ? nasClosePrice : spxClosePrice
+            int spxTime = spxSource.sourceTime
+            int spxClose = spxSource.sourceClose
+            float spxTick = spxSource.tickSize
+            float spxHighPivot = spxSource.pivotHigh
+            int spxHighPivotTime = spxSource.pivotHighTime
+            float spxLowPivot = spxSource.pivotLow
+            int spxLowPivotTime = spxSource.pivotLowTime
+            float spxATR = spxSource.atrValue
+            bool nasClosed = not na(nasTime) and not na(nasClose) and nasClose <= timenow
+            bool spxClosed = not na(spxTime) and not na(spxClose) and spxClose <= timenow
+            bool sourceAligned = not na(nasTime) and not na(spxTime) and not na(nasClose) and not na(spxClose) and nasTime == spxTime and nasClose == spxClose
+            bool sourceSynchronized = sourceAligned and nasClosed and spxClosed
+            bool newSourceBar = sourceSynchronized and (na(lastSourceClose) or nasClose > lastSourceClose)
+            if newSourceBar
+                // CFD daily break / weekend: a gap in the 5M feed. Drop every open
+                // reference and unmatched pivot so pre-break swings are never
+                // compared with post-break price.
+                if resetAcrossBreak and not na(lastSourceClose) and nasTime - lastSourceClose >= gapResetMinutes * 60000
+                    lastBreakTime := nasTime
+                    breakResetCount += 1
+                    array.clear(activeHighReferences)
+                    array.clear(activeLowReferences)
+                    array.clear(nasHighQueue)
+                    array.clear(spxHighQueue)
+                    array.clear(nasLowQueue)
+                    array.clear(spxLowQueue)
+                    array.clear(nasSourceCandles)
+                    array.clear(spxSourceCandles)
+                lastSourceClose := nasClose
+                lastDebugSourceClose := nasClose
+                int sourceCandleCapacity = maxSwingDistanceBars + 2 * swingToleranceBars + drawingPivotStrength + 3
+                f_pushSourceCandle(nasSourceCandles,
+                     SourceCandle.new(nasTime, nasClose, nasHigh, nasLow), sourceCandleCapacity)
+                f_pushSourceCandle(spxSourceCandles,
+                     SourceCandle.new(spxTime, spxClose, spxHigh, spxLow), sourceCandleCapacity)
+                int alertSourceCandleCapacity = maxSwingDistanceBars + 2 * swingToleranceBars + alertPivotStrength + 3
+                f_pushSourceCandle(alertNASSourceCandles,
+                     SourceCandle.new(nasTime, nasClose, nasHigh, nasLow), alertSourceCandleCapacity)
+                f_pushSourceCandle(alertSPXSourceCandles,
+                     SourceCandle.new(spxTime, spxClose, spxHigh, spxLow), alertSourceCandleCapacity)
+                // Independent alert-pivot engine. Pivot alerts are evaluated on
+                // this aligned, closed 5M NAS/SPX source pair only.
+                float nasAlertHighPivot = nasSource.alertPivotHigh
+                int nasAlertHighPivotTime = nasSource.alertPivotHighTime
+                float nasAlertLowPivot = nasSource.alertPivotLow
+                int nasAlertLowPivotTime = nasSource.alertPivotLowTime
+                float spxAlertHighPivot = spxSource.alertPivotHigh
+                int spxAlertHighPivotTime = spxSource.alertPivotHighTime
+                float spxAlertLowPivot = spxSource.alertPivotLow
+                int spxAlertLowPivotTime = spxSource.alertPivotLowTime
+                bool newAlertNASHigh = enableAlerts and enableBearishAlerts and not na(nasAlertHighPivotTime) and (na(lastAlertNASHighPivotTime) or nasAlertHighPivotTime != lastAlertNASHighPivotTime)
+                bool newAlertSPXHigh = enableAlerts and enableBearishAlerts and not na(spxAlertHighPivotTime) and (na(lastAlertSPXHighPivotTime) or spxAlertHighPivotTime != lastAlertSPXHighPivotTime)
+                bool newAlertNASLow = enableAlerts and enableBullishAlerts and not na(nasAlertLowPivotTime) and (na(lastAlertNASLowPivotTime) or nasAlertLowPivotTime != lastAlertNASLowPivotTime)
+                bool newAlertSPXLow = enableAlerts and enableBullishAlerts and not na(spxAlertLowPivotTime) and (na(lastAlertSPXLowPivotTime) or spxAlertLowPivotTime != lastAlertSPXLowPivotTime)
+                if newAlertNASHigh
+                    lastAlertNASHighPivotTime := nasAlertHighPivotTime
+                    f_pushPivot(alertNASHighQueue, nasAlertHighPivot, nasAlertHighPivotTime, alertPivotQueueCapacity)
+                if newAlertSPXHigh
+                    lastAlertSPXHighPivotTime := spxAlertHighPivotTime
+                    f_pushPivot(alertSPXHighQueue, spxAlertHighPivot, spxAlertHighPivotTime, alertPivotQueueCapacity)
+                if newAlertNASLow
+                    lastAlertNASLowPivotTime := nasAlertLowPivotTime
+                    f_pushPivot(alertNASLowQueue, nasAlertLowPivot, nasAlertLowPivotTime, alertPivotQueueCapacity)
+                if newAlertSPXLow
+                    lastAlertSPXLowPivotTime := spxAlertLowPivotTime
+                    f_pushPivot(alertSPXLowQueue, spxAlertLowPivot, spxAlertLowPivotTime, alertPivotQueueCapacity)
+                int alertQueueAgeMs = (swingToleranceBars + alertPivotStrength + 1) * SOURCE_MS
+                // Independent alert-pivot validation caused alerts to diverge from drawn SMTs.
+                // Keep its legacy calculations inert; validated drawing events are queued below.
+                if enableAlerts and enableBearishAlerts and false
+                    [alertHighMatched, alertHighNASTime, alertHighNASPrice, alertHighSPXTime, alertHighSPXPrice, alertHighComparedNASTime, alertHighComparedSPXTime] = f_takeMatchedPivot(alertNASHighQueue, alertSPXHighQueue, swingToleranceBars * SOURCE_MS, nasTime, alertQueueAgeMs)
+                    if alertHighMatched
+                        bool hasAlertHighReference = not na(alertReferenceNASHighTime) and not na(alertReferenceSPXHighTime) and not na(alertReferenceNASHigh) and not na(alertReferenceSPXHigh)
+                        bool alertHighChronological = hasAlertHighReference and alertHighNASTime > alertReferenceNASHighTime and alertHighSPXTime > alertReferenceSPXHighTime
+                        int alertHighPairTime = math.max(alertHighNASTime, alertHighSPXTime)
+                        int alertHighPriorPairTime = hasAlertHighReference ? math.max(alertReferenceNASHighTime, alertReferenceSPXHighTime) : na
+                        bool alertHighWithinDistance = alertHighChronological and alertHighPairTime - alertHighPriorPairTime <= maxSwingDistanceBars * SOURCE_MS
+                        bool alertNASHH = hasAlertHighReference and alertHighNASPrice > alertReferenceNASHigh
+                        bool alertSPXHH = hasAlertHighReference and alertHighSPXPrice > alertReferenceSPXHigh
+                        bool alertBearishDivergence = alertNASHH != alertSPXHH
+                        bool alertHighClear = false
+                        if hasAlertHighReference and alertHighWithinDistance and alertBearishDivergence
+                            alertHighClear := f_segmentClear(alertNASSourceCandles, alertReferenceNASHighTime, alertReferenceNASHigh, alertHighNASTime, alertHighNASPrice, true) and f_segmentClear(alertSPXSourceCandles, alertReferenceSPXHighTime, alertReferenceSPXHigh, alertHighSPXTime, alertHighSPXPrice, true)
+                        if hasAlertHighReference and alertHighWithinDistance and alertBearishDivergence and alertHighClear
+                            bool alertNASSweptHigh = alertNASHH
+                            float alertSweepDistance = alertNASSweptHigh ? alertHighNASPrice - alertReferenceNASHigh : alertHighSPXPrice - alertReferenceSPXHigh
+                            float alertHeldDistance = alertNASSweptHigh ? alertReferenceSPXHigh - alertHighSPXPrice : alertReferenceNASHigh - alertHighNASPrice
+                            float alertSweepATR = alertNASSweptHigh ? nasATR : spxATR
+                            float alertHeldATR = alertNASSweptHigh ? spxATR : nasATR
+                            float alertSweepTick = alertNASSweptHigh ? nasTick : spxTick
+                            float alertStrengthPct = not na(alertSweepATR) and alertSweepATR > 0 and not na(alertHeldATR) and alertHeldATR > 0 ? math.min(100.0, 50.0 * (alertSweepDistance / alertSweepATR + alertHeldDistance / alertHeldATR)) : na
+                            bool alertTickPass = not na(alertSweepTick) and alertSweepTick > 0 and alertSweepDistance / alertSweepTick >= minimumDivergenceTicks
+                            bool alertPercentPass = not useMinimumPercentDifference or math.abs(100.0 * (alertHighNASPrice - alertReferenceNASHigh) / alertReferenceNASHigh - 100.0 * (alertHighSPXPrice - alertReferenceSPXHigh) / alertReferenceSPXHigh) >= minimumPercentDifference
+                            bool alertStrengthPass = not na(alertStrengthPct) and alertStrengthPct >= minimumStrength
+                            string alertEventKey = "AS:" + str.tostring(alertPivotStrength) + ":" + str.tostring(alertReferenceNASHighTime) + ":" + str.tostring(alertReferenceSPXHighTime) + ">" + str.tostring(alertHighNASTime) + ":" + str.tostring(alertHighSPXTime) + ":C:" + str.tostring(nasClose)
+                            if alertTickPass and alertPercentPass and alertStrengthPass and not array.includes(alertProcessedKeys, alertEventKey) and array.size(pendingAlerts) < pendingAlertCapacity
+                                array.push(alertProcessedKeys, alertEventKey)
+                                while array.size(alertProcessedKeys) > 512
+                                    array.shift(alertProcessedKeys)
+                                array.push(pendingAlerts, PendingSmt.new(alertEventKey, false, "1", nasClose, chartConfirmationClose, 0, false))
+                            if not hasAlertHighReference or alertHighChronological
+                                alertReferenceNASHighTime := alertHighNASTime
+                                alertReferenceNASHigh := alertHighNASPrice
+                                alertReferenceSPXHighTime := alertHighSPXTime
+                                alertReferenceSPXHigh := alertHighSPXPrice
+                if enableAlerts and enableBullishAlerts and false
+                    [alertLowMatched, alertLowNASTime, alertLowNASPrice, alertLowSPXTime, alertLowSPXPrice, alertLowComparedNASTime, alertLowComparedSPXTime] = f_takeMatchedPivot(alertNASLowQueue, alertSPXLowQueue, swingToleranceBars * SOURCE_MS, nasTime, alertQueueAgeMs)
+                    if alertLowMatched
+                        bool hasAlertLowReference = not na(alertReferenceNASLowTime) and not na(alertReferenceSPXLowTime) and not na(alertReferenceNASLow) and not na(alertReferenceSPXLow)
+                        bool alertLowChronological = hasAlertLowReference and alertLowNASTime > alertReferenceNASLowTime and alertLowSPXTime > alertReferenceSPXLowTime
+                        int alertLowPairTime = math.max(alertLowNASTime, alertLowSPXTime)
+                        int alertLowPriorPairTime = hasAlertLowReference ? math.max(alertReferenceNASLowTime, alertReferenceSPXLowTime) : na
+                        bool alertLowWithinDistance = alertLowChronological and alertLowPairTime - alertLowPriorPairTime <= maxSwingDistanceBars * SOURCE_MS
+                        bool alertNASLL = hasAlertLowReference and alertLowNASPrice < alertReferenceNASLow
+                        bool alertSPXLL = hasAlertLowReference and alertLowSPXPrice < alertReferenceSPXLow
+                        bool alertBullishDivergence = alertNASLL != alertSPXLL
+                        bool alertLowClear = false
+                        if hasAlertLowReference and alertLowWithinDistance and alertBullishDivergence
+                            alertLowClear := f_segmentClear(alertNASSourceCandles, alertReferenceNASLowTime, alertReferenceNASLow, alertLowNASTime, alertLowNASPrice, false) and f_segmentClear(alertSPXSourceCandles, alertReferenceSPXLowTime, alertReferenceSPXLow, alertLowSPXTime, alertLowSPXPrice, false)
+                        if hasAlertLowReference and alertLowWithinDistance and alertBullishDivergence and alertLowClear
+                            bool alertNASSweptLow = alertNASLL
+                            float alertSweepDistance = alertNASSweptLow ? alertReferenceNASLow - alertLowNASPrice : alertReferenceSPXLow - alertLowSPXPrice
+                            float alertHeldDistance = alertNASSweptLow ? alertLowSPXPrice - alertReferenceSPXLow : alertLowNASPrice - alertReferenceNASLow
+                            float alertSweepATR = alertNASSweptLow ? nasATR : spxATR
+                            float alertHeldATR = alertNASSweptLow ? spxATR : nasATR
+                            float alertSweepTick = alertNASSweptLow ? nasTick : spxTick
+                            float alertStrengthPct = not na(alertSweepATR) and alertSweepATR > 0 and not na(alertHeldATR) and alertHeldATR > 0 ? math.min(100.0, 50.0 * (alertSweepDistance / alertSweepATR + alertHeldDistance / alertHeldATR)) : na
+                            bool alertTickPass = not na(alertSweepTick) and alertSweepTick > 0 and alertSweepDistance / alertSweepTick >= minimumDivergenceTicks
+                            bool alertPercentPass = not useMinimumPercentDifference or math.abs(100.0 * (alertReferenceNASLow - alertLowNASPrice) / alertReferenceNASLow - 100.0 * (alertReferenceSPXLow - alertLowSPXPrice) / alertReferenceSPXLow) >= minimumPercentDifference
+                            bool alertStrengthPass = not na(alertStrengthPct) and alertStrengthPct >= minimumStrength
+                            string alertEventKey = "AB:" + str.tostring(alertPivotStrength) + ":" + str.tostring(alertReferenceNASLowTime) + ":" + str.tostring(alertReferenceSPXLowTime) + ">" + str.tostring(alertLowNASTime) + ":" + str.tostring(alertLowSPXTime) + ":C:" + str.tostring(nasClose)
+                            if alertTickPass and alertPercentPass and alertStrengthPass and not array.includes(alertProcessedKeys, alertEventKey) and array.size(pendingAlerts) < pendingAlertCapacity
+                                array.push(alertProcessedKeys, alertEventKey)
+                                while array.size(alertProcessedKeys) > 512
+                                    array.shift(alertProcessedKeys)
+                                array.push(pendingAlerts, PendingSmt.new(alertEventKey, true, "1", nasClose, chartConfirmationClose, 0, false))
+                            if not hasAlertLowReference or alertLowChronological
+                                alertReferenceNASLowTime := alertLowNASTime
+                                alertReferenceNASLow := alertLowNASPrice
+                                alertReferenceSPXLowTime := alertLowSPXTime
+                                alertReferenceSPXLow := alertLowSPXPrice
+                bool newNASHighPivot = needBearishEngine and not na(nasHighPivotTime) and (na(lastNASHighPivotTime) or nasHighPivotTime != lastNASHighPivotTime) and (na(lastBreakTime) or nasHighPivotTime >= lastBreakTime)
+                bool newSPXHighPivot = needBearishEngine and not na(spxHighPivotTime) and (na(lastSPXHighPivotTime) or spxHighPivotTime != lastSPXHighPivotTime) and (na(lastBreakTime) or spxHighPivotTime >= lastBreakTime)
+                bool newNASLowPivot = needBullishEngine and not na(nasLowPivotTime) and (na(lastNASLowPivotTime) or nasLowPivotTime != lastNASLowPivotTime) and (na(lastBreakTime) or nasLowPivotTime >= lastBreakTime)
+                bool newSPXLowPivot = needBullishEngine and not na(spxLowPivotTime) and (na(lastSPXLowPivotTime) or spxLowPivotTime != lastSPXLowPivotTime) and (na(lastBreakTime) or spxLowPivotTime >= lastBreakTime)
+                if newNASHighPivot
+                    lastNASHighPivotTime := nasHighPivotTime
+                    nasPivotCount += 1
+                    f_pushPivot(nasHighQueue, nasHighPivot, nasHighPivotTime, pivotQueueCapacity)
+                if newSPXHighPivot
+                    lastSPXHighPivotTime := spxHighPivotTime
+                    spxPivotCount += 1
+                    f_pushPivot(spxHighQueue, spxHighPivot, spxHighPivotTime, pivotQueueCapacity)
+                if newNASLowPivot
+                    lastNASLowPivotTime := nasLowPivotTime
+                    nasPivotCount += 1
+                    f_pushPivot(nasLowQueue, nasLowPivot, nasLowPivotTime, pivotQueueCapacity)
+                if newSPXLowPivot
+                    lastSPXLowPivotTime := spxLowPivotTime
+                    spxPivotCount += 1
+                    f_pushPivot(spxLowQueue, spxLowPivot, spxLowPivotTime, pivotQueueCapacity)
+                if newNASHighPivot or newSPXHighPivot
+                    debugHighPair := "NAS " + f_debugTime(lastNASHighPivotTime) + " / SPX " + f_debugTime(lastSPXHighPivotTime)
+                    debugHighSync := "waiting for confirmed one-to-one match"
+                if newNASLowPivot or newSPXLowPivot
+                    debugLowPair := "NAS " + f_debugTime(lastNASLowPivotTime) + " / SPX " + f_debugTime(lastSPXLowPivotTime)
+                    debugLowSync := "waiting for confirmed one-to-one match"
+                // Match confirmed pivot highs one-to-one, then compare this matched
+                // swing pair with the prior matched swing pair. Candle wicks alone can
+                // never create SMT events.
+                int toleranceMs = swingToleranceBars * SOURCE_MS
+                int queueAgeMs = (swingToleranceBars + drawingPivotStrength + 1) * SOURCE_MS
+                // Sweep-based SMT. Matched confirmed pivot pairs become active
+                // reference levels. A closed, synchronized 5M candle on which exactly one
+                // market takes its reference (and the other market has never taken its
+                // own) is the SMT event. The drawing and the alert below are both built
+                // from this single validated event.
+                int maxReferenceAgeMs = maxSwingDistanceBars * SOURCE_MS
+                if needBearishEngine
+                    [highMatched, highNASTime, highNASPrice, highSPXTime, highSPXPrice, highComparedNASTime, highComparedSPXTime] =
+                         f_takeMatchedPivot(nasHighQueue, spxHighQueue, toleranceMs, nasTime, queueAgeMs)
+                    if not na(highComparedNASTime) and not na(highComparedSPXTime)
+                        debugHighPair := "NAS " + f_debugTime(highComparedNASTime) + " / SPX " + f_debugTime(highComparedSPXTime)
+                        debugHighSync := highMatched ? "PASS (within " + str.tostring(swingToleranceBars) + " bars)" : "FAIL (outside tolerance / waiting)"
+                    if highMatched
+                        matchedHighCount += 1
+                        debugHighPair := "NAS " + f_debugTime(highNASTime) + " @ " + str.tostring(highNASPrice, format.mintick) +
+                             " | SPX " + f_debugTime(highSPXTime) + " @ " + str.tostring(highSPXPrice, format.mintick)
+                        bool highRegistered = f_registerReference(activeHighReferences, nasSourceCandles, spxSourceCandles, true,
+                             highNASTime, highNASPrice, highSPXTime, highSPXPrice, nasClose, REFERENCE_CAPACITY)
+                        debugSignalStatus := highRegistered ? "High pair registered as active sweep reference" :
+                             "High pair already taken by both markets; not registered"
+                    else if not na(highComparedNASTime) and not na(highComparedSPXTime)
+                        debugSignalStatus := "High pivots not matched; no reference registered"
+                    [bearFound, bearRefNASTime, bearRefNASPrice, bearRefSPXTime, bearRefSPXPrice, bearSweepTime,
+                         bearEndNASPrice, bearEndSPXPrice, bearNASSwept, bearDivergedCount, bearReason] =
+                         f_evaluateSweeps(activeHighReferences, nasSourceCandles, spxSourceCandles, true, nasTime, nasClose,
+                         nasHigh, spxHigh, nasATR, spxATR, nasTick, spxTick, maxReferenceAgeMs,
+                         nasSource.magnetAbove1, nasSource.magnetAbove2)
+                    if bearFound
+                        string eventKey = "S:" + str.tostring(bearRefNASTime) + ":" + str.tostring(bearRefSPXTime) + ">" + str.tostring(bearSweepTime) + ":" + str.tostring(bearSweepTime) + ":C:" + str.tostring(nasClose)
+                        if not array.includes(processedEventKeys, eventKey)
+                            array.push(processedEventKeys, eventKey)
+                            while array.size(processedEventKeys) > 512
+                                array.shift(processedEventKeys)
+                            bearishSignalCount += 1
+                            debugSignalStatus := "BEARISH SMT confirmed: " + (bearNASSwept ? "NAS swept high; SPX held" : "SPX swept high; NAS held")
+                            // Trend filter: the drawing and the alert follow the same decision.
+                            bool bearCounter = trendMode != "Off" and bias24State == "UP"
+                            bool bearMuted = trendMode != "Off" and bias24State != "DOWN"
+                            bool bearHidden = trendMode == "Hide counter-trend" and bearCounter
+                            if bearHidden
+                                debugSignalStatus := debugSignalStatus + " (hidden: counter-trend)"
+                            // The drawing and the alert share this one validated event.
+                            if not bearHidden and enableAlerts and enableBearishAlerts and not array.includes(alertProcessedKeys, eventKey)
+                                array.push(alertProcessedKeys, eventKey)
+                                while array.size(alertProcessedKeys) > 512
+                                    array.shift(alertProcessedKeys)
+                                array.push(pendingAlerts, PendingSmt.new(eventKey, false, "1", nasClose, chartConfirmationClose, 0, false, bearNASSwept ? nasTicker : spxTicker, drawUsingNASPrices ? bearEndNASPrice : bearEndSPXPrice))
+                            int lineStartTime = drawUsingNASPrices ? bearRefNASTime : bearRefSPXTime
+                            float lineStartPrice = drawUsingNASPrices ? bearRefNASPrice : bearRefSPXPrice
+                            float lineEndPrice = drawUsingNASPrices ? bearEndNASPrice : bearEndSPXPrice
+                            if not bearHidden and showHistoricalLines and drawingsVisible and showBearishLines
+                                DrawSmt drawing = DrawSmt.new(false, bearMuted, nasClose, lineStartTime, lineStartPrice, bearSweepTime, lineEndPrice)
+                                f_recordDraw(historicalDraws, pendingDraws, drawing, maximumHistoricalSignals, showOnlyLatest, barstate.ishistory)
+                    else if bearDivergedCount > 0
+                        debugSignalStatus := "Bearish sweep not confirmed: " + bearReason
+                // Bullish SMT uses the same reference/sweep logic on confirmed lows.
+                if needBullishEngine
+                    [lowMatched, lowNASTime, lowNASPrice, lowSPXTime, lowSPXPrice, lowComparedNASTime, lowComparedSPXTime] =
+                         f_takeMatchedPivot(nasLowQueue, spxLowQueue, toleranceMs, nasTime, queueAgeMs)
+                    if not na(lowComparedNASTime) and not na(lowComparedSPXTime)
+                        debugLowPair := "NAS " + f_debugTime(lowComparedNASTime) + " / SPX " + f_debugTime(lowComparedSPXTime)
+                        debugLowSync := lowMatched ? "PASS (within " + str.tostring(swingToleranceBars) + " bars)" : "FAIL (outside tolerance / waiting)"
+                    if lowMatched
+                        matchedLowCount += 1
+                        debugLowPair := "NAS " + f_debugTime(lowNASTime) + " @ " + str.tostring(lowNASPrice, format.mintick) +
+                             " | SPX " + f_debugTime(lowSPXTime) + " @ " + str.tostring(lowSPXPrice, format.mintick)
+                        bool lowRegistered = f_registerReference(activeLowReferences, nasSourceCandles, spxSourceCandles, false,
+                             lowNASTime, lowNASPrice, lowSPXTime, lowSPXPrice, nasClose, REFERENCE_CAPACITY)
+                        debugSignalStatus := lowRegistered ? "Low pair registered as active sweep reference" :
+                             "Low pair already taken by both markets; not registered"
+                    else if not na(lowComparedNASTime) and not na(lowComparedSPXTime)
+                        debugSignalStatus := "Low pivots not matched; no reference registered"
+                    [bullFound, bullRefNASTime, bullRefNASPrice, bullRefSPXTime, bullRefSPXPrice, bullSweepTime,
+                         bullEndNASPrice, bullEndSPXPrice, bullNASSwept, bullDivergedCount, bullReason] =
+                         f_evaluateSweeps(activeLowReferences, nasSourceCandles, spxSourceCandles, false, nasTime, nasClose,
+                         nasLow, spxLow, nasATR, spxATR, nasTick, spxTick, maxReferenceAgeMs,
+                         nasSource.magnetBelow1, nasSource.magnetBelow2)
+                    if bullFound
+                        string eventKey = "B:" + str.tostring(bullRefNASTime) + ":" + str.tostring(bullRefSPXTime) + ">" + str.tostring(bullSweepTime) + ":" + str.tostring(bullSweepTime) + ":C:" + str.tostring(nasClose)
+                        if not array.includes(processedEventKeys, eventKey)
+                            array.push(processedEventKeys, eventKey)
+                            while array.size(processedEventKeys) > 512
+                                array.shift(processedEventKeys)
+                            bullishSignalCount += 1
+                            debugSignalStatus := "BULLISH SMT confirmed: " + (bullNASSwept ? "NAS swept low; SPX held" : "SPX swept low; NAS held")
+                            // Trend filter: the drawing and the alert follow the same decision.
+                            bool bullCounter = trendMode != "Off" and bias24State == "DOWN"
+                            bool bullMuted = trendMode != "Off" and bias24State != "UP"
+                            bool bullHidden = trendMode == "Hide counter-trend" and bullCounter
+                            if bullHidden
+                                debugSignalStatus := debugSignalStatus + " (hidden: counter-trend)"
+                            // The drawing and the alert share this one validated event.
+                            if not bullHidden and enableAlerts and enableBullishAlerts and not array.includes(alertProcessedKeys, eventKey)
+                                array.push(alertProcessedKeys, eventKey)
+                                while array.size(alertProcessedKeys) > 512
+                                    array.shift(alertProcessedKeys)
+                                array.push(pendingAlerts, PendingSmt.new(eventKey, true, "1", nasClose, chartConfirmationClose, 0, false, bullNASSwept ? nasTicker : spxTicker, drawUsingNASPrices ? bullEndNASPrice : bullEndSPXPrice))
+                            int lineStartTime = drawUsingNASPrices ? bullRefNASTime : bullRefSPXTime
+                            float lineStartPrice = drawUsingNASPrices ? bullRefNASPrice : bullRefSPXPrice
+                            float lineEndPrice = drawUsingNASPrices ? bullEndNASPrice : bullEndSPXPrice
+                            if not bullHidden and showHistoricalLines and drawingsVisible and showBullishLines
+                                DrawSmt drawing = DrawSmt.new(true, bullMuted, nasClose, lineStartTime, lineStartPrice, bullSweepTime, lineEndPrice)
+                                f_recordDraw(historicalDraws, pendingDraws, drawing, maximumHistoricalSignals, showOnlyLatest, barstate.ishistory)
+                    else if bullDivergedCount > 0
+                        debugSignalStatus := "Bullish sweep not confirmed: " + bullReason
+                // Pending alerts advance only on closed 5M source candles, so the
+                // delay counts real 5M candle closes.
+                f_processPendingAlerts(pendingAlerts, alertedKeys, nasClose,
+                     candleClosesBeforeAlert, enableAlerts, enableBullishAlerts, enableBearishAlerts)
+            nasIndex += 1
+            spxIndex += 1
+        else if nasSource.sourceTime < spxSource.sourceTime
+            nasIndex += 1
+        else if nasSource.sourceTime > spxSource.sourceTime
+            spxIndex += 1
+        else if nasSource.sourceClose < spxSource.sourceClose
+            nasIndex += 1
+        else
+            spxIndex += 1
+// During initial history processing, retain only the latest N event records
+// and create those drawings once at the last historical bar. Live 5M events
+// remain queued until the host chart bar confirms, so source closes inside a chart candle are retained.
+if barstate.islastconfirmedhistory and array.size(historicalDraws) > 0
+    while array.size(historicalDraws) > 0
+        DrawSmt historicalDrawing = array.shift(historicalDraws)
+        f_renderDraw(historicalDrawing, smtLines, drawnKeys, maximumHistoricalSignals,
+             showOnlyLatest, showHistoricalLines, bullishColor, bearishColor, lineTransparency, lineWidth)
+// Live SMT lines are drawn on every update (so the line shows up at the same
+// moment as the alert) and are kept for good when the chart bar confirms.
+if array.size(pendingDraws) > 0
+    for drawing in pendingDraws
+        f_renderDraw(drawing, smtLines, drawnKeys, maximumHistoricalSignals,
+             showOnlyLatest, showHistoricalLines, bullishColor, bearishColor, lineTransparency, lineWidth)
+    if barstate.isconfirmed
+        array.clear(pendingDraws)
+//====================================================
+// Optional, low-overhead debug table
+//====================================================
+var table debugTable = table.new(position.top_right, 2, 17, border_width=1)
+if barstate.islast and debugMode
+    table.cell(debugTable, 0, 0, "5M SMT Debug", text_color=color.white, bgcolor=color.new(color.blue, 55))
+    table.cell(debugTable, 1, 0, "Value", text_color=color.white, bgcolor=color.new(color.blue, 55))
+    table.cell(debugTable, 0, 1, "Chart market", text_color=color.white)
+    table.cell(debugTable, 1, 1, syminfo.prefix + ":" + syminfo.ticker + (chartIsPepperstone ? "" : " (NOT Pepperstone feed)"), text_color=color.white)
+    table.cell(debugTable, 0, 2, "Engine active", text_color=color.white)
+    table.cell(debugTable, 1, 2, canRunEngine ? "yes" : "no", text_color=color.white)
+    table.cell(debugTable, 0, 3, "Latest " + nasTicker + " H / L", text_color=color.white)
+    table.cell(debugTable, 1, 3, f_debugTime(lastNASHighPivotTime) + " / " + f_debugTime(lastNASLowPivotTime), text_color=color.white)
+    table.cell(debugTable, 0, 4, "Latest " + spxTicker + " H / L", text_color=color.white)
+    table.cell(debugTable, 1, 4, f_debugTime(lastSPXHighPivotTime) + " / " + f_debugTime(lastSPXLowPivotTime), text_color=color.white)
+    table.cell(debugTable, 0, 5, "High pivots compared", text_color=color.white)
+    table.cell(debugTable, 1, 5, debugHighPair, text_color=color.white)
+    table.cell(debugTable, 0, 6, "High pair sync", text_color=color.white)
+    table.cell(debugTable, 1, 6, debugHighSync, text_color=color.white)
+    table.cell(debugTable, 0, 7, "Low pivots compared", text_color=color.white)
+    table.cell(debugTable, 1, 7, debugLowPair, text_color=color.white)
+    table.cell(debugTable, 0, 8, "Low pair sync", text_color=color.white)
+    table.cell(debugTable, 1, 8, debugLowSync, text_color=color.white)
+    table.cell(debugTable, 0, 9, nasTicker + " / " + spxTicker + " pivots", text_color=color.white)
+    table.cell(debugTable, 1, 9, str.tostring(nasPivotCount) + " / " + str.tostring(spxPivotCount), text_color=color.white)
+    table.cell(debugTable, 0, 10, "Matched H / L", text_color=color.white)
+    table.cell(debugTable, 1, 10, str.tostring(matchedHighCount) + " / " + str.tostring(matchedLowCount), text_color=color.white)
+    table.cell(debugTable, 0, 11, "Bull / bear SMT", text_color=color.white)
+    table.cell(debugTable, 1, 11, str.tostring(bullishSignalCount) + " / " + str.tostring(bearishSignalCount), text_color=color.white)
+    table.cell(debugTable, 0, 12, "Latest SMT validation", text_color=color.white)
+    table.cell(debugTable, 1, 12, debugSignalStatus, text_color=color.white)
+    table.cell(debugTable, 0, 13, "Alert state", text_color=color.white)
+    table.cell(debugTable, 1, 13, debugAlertStatus, text_color=color.white)
+    table.cell(debugTable, 0, 14, "Alert reason", text_color=color.white)
+    table.cell(debugTable, 1, 14, debugAlertReason, text_color=color.white)
+    table.cell(debugTable, 0, 15, "Last source close (Oslo)", text_color=color.white)
+    table.cell(debugTable, 1, 15, na(lastDebugSourceClose) ? "—" : str.format_time(lastDebugSourceClose, "MM-dd HH:mm", "Europe/Oslo"), text_color=color.white)
+    table.cell(debugTable, 0, 16, "Break resets", text_color=color.white)
+    table.cell(debugTable, 1, 16, str.tostring(breakResetCount) + (na(lastBreakTime) ? "" : " (last " + f_debugTime(lastBreakTime) + ")"), text_color=color.white)
+// The signal is only valid for MT5 when it comes from the same broker feed.
+var table feedWarning = table.new(position.bottom_right, 1, 1)
+if barstate.islast and not chartIsPepperstone
+    table.cell(feedWarning, 0, 0, "Chart is not on the PEPPERSTONE feed. Prices will not match the MT5 account.",
+         text_color=color.white, bgcolor=color.new(color.red, 20))
