@@ -2,7 +2,7 @@
 indicator("Pepperstone NAS100 / US500 5M SMT", overlay=true, max_lines_count=500, dynamic_requests=true)
 // CFD version of the MNQ/MES 5M SMT indicator, built for Pepperstone's feed so
 // the TradingView signal matches the prices in the Pepperstone MT5 account.
-// Use it on a PEPPERSTONE:NAS100.P or PEPPERSTONE:US500.P chart (5M or lower for drawings).
+// Use it on a PEPPERSTONE:NAS100 or PEPPERSTONE:US500 chart (5M or lower for drawings).
 // Native 5-minute NAS100/US500 data is requested once per symbol. Chart symbol
 // detection is deliberately kept outside the request expressions so it cannot
 // accidentally resolve to NAS100 while evaluating a requested NAS100 context.
@@ -10,8 +10,8 @@ indicator("Pepperstone NAS100 / US500 5M SMT", overlay=true, max_lines_count=500
 // Settings
 //====================================================
 string GROUP_SYMBOLS = "Symbols"
-string nasSymbolInput = input.symbol("PEPPERSTONE:NAS100.P", "Nasdaq 100 CFD", group=GROUP_SYMBOLS)
-string spxSymbolInput = input.symbol("PEPPERSTONE:US500.P", "S&P 500 CFD", group=GROUP_SYMBOLS,
+string nasSymbolInput = input.symbol("PEPPERSTONE:NAS100", "Nasdaq 100 CFD", group=GROUP_SYMBOLS)
+string spxSymbolInput = input.symbol("PEPPERSTONE:US500", "S&P 500 CFD", group=GROUP_SYMBOLS,
      tooltip="The chart you put the indicator on always supplies its own leg, so lines sit exactly on that chart's candles. These inputs set the other leg. Keep both pointing at the same symbols you trade in MT5.")
 int SOURCE_SECONDS = 300
 int SOURCE_MS = SOURCE_SECONDS * 1000
@@ -87,7 +87,7 @@ bool needBearishEngine = debugMode or (enableAlerts and enableBearishAlerts) or
 bool canRunEngine = supportedChart and (needBullishEngine or needBearishEngine)
 bool drawUsingNASPrices = chartIsNAS
 if barstate.isfirst and not supportedChart
-    runtime.error("Use this indicator on a PEPPERSTONE:NAS100.P or PEPPERSTONE:US500.P chart.")
+    runtime.error("Use this indicator on a PEPPERSTONE:NAS100 or PEPPERSTONE:US500 chart.")
 if barstate.isfirst and na(chartSeconds)
     runtime.error("Use this indicator on a time-based chart.")
 //====================================================
@@ -151,6 +151,7 @@ type PendingSmt
     int completedCandlesSinceConfirmation
     bool alertSent
     string sweeper = ""
+    float smtLevel = na  // low/high (on the chart symbol) of the candle that formed the SMT
 type SourceCandle
     int sourceTime
     int sourceClose
@@ -538,6 +539,7 @@ f_alertJson(PendingSmt pending, bool trendAligned) =>
          q + "bias" + q + ":" + q + bias24State + q + "," +
          q + "change_24h_pct" + q + ":" + pctText + "," +
          q + "trend_aligned" + q + ":" + (trendAligned ? "true" : "false") + "," +
+         q + "smt_level" + q + ":" + (na(pending.smtLevel) ? "null" : str.tostring(pending.smtLevel, format.mintick)) + "," +
          q + "event_id" + q + ":" + q + pending.eventId + q +
          "}"
 // Called exactly once per closed, synchronized 5M source candle. The candle that
@@ -950,7 +952,7 @@ if canRunEngine
                                 array.push(alertProcessedKeys, eventKey)
                                 while array.size(alertProcessedKeys) > 512
                                     array.shift(alertProcessedKeys)
-                                array.push(pendingAlerts, PendingSmt.new(eventKey, false, "5", nasClose, chartConfirmationClose, 0, false, bearNASSwept ? nasTicker : spxTicker))
+                                array.push(pendingAlerts, PendingSmt.new(eventKey, false, "5", nasClose, chartConfirmationClose, 0, false, bearNASSwept ? nasTicker : spxTicker, drawUsingNASPrices ? bearEndNASPrice : bearEndSPXPrice))
                             int lineStartTime = drawUsingNASPrices ? bearRefNASTime : bearRefSPXTime
                             float lineStartPrice = drawUsingNASPrices ? bearRefNASPrice : bearRefSPXPrice
                             float lineEndPrice = drawUsingNASPrices ? bearEndNASPrice : bearEndSPXPrice
@@ -993,7 +995,7 @@ if canRunEngine
                                 array.push(alertProcessedKeys, eventKey)
                                 while array.size(alertProcessedKeys) > 512
                                     array.shift(alertProcessedKeys)
-                                array.push(pendingAlerts, PendingSmt.new(eventKey, true, "5", nasClose, chartConfirmationClose, 0, false, bullNASSwept ? nasTicker : spxTicker))
+                                array.push(pendingAlerts, PendingSmt.new(eventKey, true, "5", nasClose, chartConfirmationClose, 0, false, bullNASSwept ? nasTicker : spxTicker, drawUsingNASPrices ? bullEndNASPrice : bullEndSPXPrice))
                             int lineStartTime = drawUsingNASPrices ? bullRefNASTime : bullRefSPXTime
                             float lineStartPrice = drawUsingNASPrices ? bullRefNASPrice : bullRefSPXPrice
                             float lineEndPrice = drawUsingNASPrices ? bullEndNASPrice : bullEndSPXPrice

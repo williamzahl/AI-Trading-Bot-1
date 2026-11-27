@@ -50,8 +50,8 @@ TAKE_PROFIT_PCT = _num("TAKE_PROFIT_PCT", 0.5)     # TP-avstand i % av prisen
 # 0 = bruk fast TRADE_LOT i stedet.
 RISK_USD = _num("RISK_USD", 250)
 RISK_REWARD = _num("RISK_REWARD", 3)               # TP = 3 x SL-avstand
-SL_LOOKBACK_BARS = int(_num("SL_LOOKBACK_BARS", 6))  # SL under laveste low (5M) siste N lys
-SL_BUFFER_POINTS = _num("SL_BUFFER_POINTS", 2)     # ekstra avstand under low / over high (i pris)
+SL_LOOKBACK_BARS = int(_num("SL_LOOKBACK_BARS", 6))  # reserve hvis varselet mangler smt_level
+SL_BUFFER_POINTS = _num("SL_BUFFER_POINTS", 1)     # ekstra avstand under SMT-low / over SMT-high (i pris)
 MAX_LOT = _num("MAX_LOT", 20)                      # sikkerhetstak paa lot
 MAX_SL_PCT = _num("MAX_SL_PCT", 1.0)               # hopp over trade hvis SL er lenger unna enn dette (%)
 MAX_OPEN_POSITIONS = int(_num("MAX_OPEN_POSITIONS", 1))
