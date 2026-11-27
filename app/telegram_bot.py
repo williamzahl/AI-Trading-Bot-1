@@ -216,7 +216,8 @@ async def _handle_message(msg: dict) -> None:
                       f"(1:{config.RISK_REWARD:g})",
                       "SL: under SMT-low / over SMT-high, pluss",
                       *[f"   {sym}: {config.sl_buffer(sym):g} pkt" for sym in config.ALLOWED_SYMBOLS],
-                      "Lot: regnes ut automatisk"]
+                      f"   Minst {config.MIN_SL_POINTS:g} pkt fra inngang",
+                      f"Lot: regnes ut automatisk (maks {config.MAX_MARGIN_PCT:g} % av fri margin)"]
         else:
             lines += [f"Lot: {config.TRADE_LOT:g}",
                       f"SL: {config.STOP_LOSS_PCT:g} %  |  TP: {config.TAKE_PROFIT_PCT:g} %"]

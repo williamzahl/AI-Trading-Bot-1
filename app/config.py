@@ -81,6 +81,11 @@ def sl_buffer(symbol: str) -> float:
     if MT5_SYMBOL_SUFFIX and sym.endswith(MT5_SYMBOL_SUFFIX.upper()):
         sym = sym[: -len(MT5_SYMBOL_SUFFIX)]
     return SL_BUFFER.get(sym, SL_BUFFER_POINTS)
+# Minste SL-avstand fra inngang (i pris/punkter). Er SMT-lowen naermere, flyttes SL
+# lenger unna slik at lot (og margin) ikke blir urimelig stor. Risiko i $ er den samme.
+MIN_SL_POINTS = _num("MIN_SL_POINTS", 15)
+# Bruk maks saa mange % av fri margin paa én trade. Lot kuttes ned ellers.
+MAX_MARGIN_PCT = _num("MAX_MARGIN_PCT", 50)
 MAX_LOT = _num("MAX_LOT", 20)                      # sikkerhetstak paa lot
 MAX_SL_PCT = _num("MAX_SL_PCT", 1.0)               # hopp over trade hvis SL er lenger unna enn dette (%)
 MAX_OPEN_POSITIONS = int(_num("MAX_OPEN_POSITIONS", 1))

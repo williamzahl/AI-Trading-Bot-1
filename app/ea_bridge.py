@@ -106,7 +106,8 @@ async def next_order(account: str = "", algo: str = "", vps: str = "") -> str:
                     f"max_pos={config.MAX_OPEN_POSITIONS};risk_usd={config.RISK_USD};"
                     f"rr={config.RISK_REWARD};lookback={config.SL_LOOKBACK_BARS};"
                     f"buffer={config.sl_buffer(symbol):g};max_lot={config.MAX_LOT};"
-                    f"max_sl_pct={config.MAX_SL_PCT};smt_level={_smt_level(sig)}")
+                    f"max_sl_pct={config.MAX_SL_PCT};min_sl={config.MIN_SL_POINTS:g};"
+                    f"max_margin_pct={config.MAX_MARGIN_PCT:g};smt_level={_smt_level(sig)}")
     return "NONE"
 
 
