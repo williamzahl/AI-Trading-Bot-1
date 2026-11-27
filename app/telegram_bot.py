@@ -199,6 +199,18 @@ async def _handle_message(msg: dict) -> None:
         handel = "PÅ ✅" if ok else f"⛔ {why}"
         modus = "🤖 Automatisk" if config.AUTO_TRADE else "✋ Manuell (APPROVE)"
         lines = [f"Handel: {handel}", f"Modus: {modus}", f"Strategi: {config.STRATEGY}", ""]
+        if config.TEST_IGNORE_TREND_1M:
+            lines.insert(-1, "🧪 Test 1M: PÅ (trendfilter av for 1M-signaler)")
+            with SessionLocal() as db_s:
+                last = (db_s.query(Signal).filter(Signal.indicator.ilike("%1M_TEST%"))
+                        .order_by(Signal.id.desc()).first())
+            if last:
+                res = {"FILLED": "tatt ✅", "QUEUED": "i kø", "SENDING": "sendes", "SKIPPED": "hoppet over",
+                       "FAILED": "feilet ⚠️", "NEW": "ny", "INFO": "kun info", "APPROVED": "godkjent"}.get(
+                    last.exec_status or last.status or "", last.exec_status or last.status or "-")
+                lines.insert(-1, f"   Siste test: #{last.id} {last.signal or ''} {oslo(last.received_at, '%d.%m %H:%M')} ({res})")
+            else:
+                lines.insert(-1, "   Ingen 1M-testsignaler mottatt ennå")
         if executor.ea_mode() and config.RISK_USD > 0:
             lines += [f"Risiko: {config.RISK_USD:g} $ → Mål: {config.RISK_USD * config.RISK_REWARD:g} $ "
                       f"(1:{config.RISK_REWARD:g})",
@@ -220,9 +232,24 @@ async def _handle_message(msg: dict) -> None:
             else:
                 ago = f"{seen / 60:.0f} min" if seen < 3600 else f"{seen / 3600:.1f} t"
                 lines.append(f"MT5-EA: 🔴 ({ago} siden)")
-            algo = ea_bridge.algo_state()
-            lines.append({"1": "Algo Trading (VPS): PÅ ✅", "0": "Algo Trading (VPS): AV ❌"}.get(
-                algo or "", "Algo Trading (VPS): ukjent (oppdater EA til v1.31)"))
+            terms = ea_bridge.terminals()
+            if terms:
+                for where, label in (("vps", "VPS"), ("pc", "PC")):
+                    if where not in terms:
+                        continue
+                    algo, ago = terms[where]
+                    if ago > 120:
+                        if where == "pc":
+                            continue  # PC-en er av: helt greit
+                        lines.append(f"Algo Trading ({label}): 🔴 EA ikke sett på {ago / 60:.0f} min")
+                    else:
+                        lines.append(f"Algo Trading ({label}): " + ("PÅ ✅" if algo == "1" else "AV ❌"))
+                if "vps" not in terms or terms["vps"][1] > 120:
+                    lines.append("⚠️ Ingen EA på VPS-en svarer")
+            else:
+                algo = ea_bridge.algo_state()
+                lines.append({"1": "Algo Trading: PÅ ✅", "0": "Algo Trading: AV ❌"}.get(
+                    algo or "", "Algo Trading: ukjent") + " (oppdater EA til v1.32 for VPS/PC)")
         elif executor.configured():
             try:
                 acc = await executor.account_info()

@@ -48,7 +48,22 @@ def algo_state() -> str | None:
     return get_setting(ALGO_KEY) or None
 
 
-async def next_order(account: str = "", algo: str = "") -> str:
+def terminals() -> dict[str, tuple[str, float]]:
+    """{'vps'|'pc': (algo '1'/'0', sekunder siden sist)} for EA v1.32+."""
+    out = {}
+    now = datetime.now(timezone.utc)
+    for where in ("vps", "pc"):
+        v = get_setting(f"ea_term_{where}")
+        if v and "|" in v:
+            algo, ts = v.split("|", 1)
+            try:
+                out[where] = (algo, (now - datetime.fromisoformat(ts)).total_seconds())
+            except ValueError:
+                pass
+    return out
+
+
+async def next_order(account: str = "", algo: str = "", vps: str = "") -> str:
     """Neste ordre som tekst, eller 'NONE'."""
     now = datetime.now(timezone.utc)
     set_setting(HEARTBEAT_KEY, now.isoformat())
@@ -56,6 +71,8 @@ async def next_order(account: str = "", algo: str = "") -> str:
         set_setting("ea_account", account[:64])
     if algo in ("0", "1"):
         set_setting(ALGO_KEY, algo)
+        if vps in ("0", "1"):
+            set_setting(f"ea_term_{'vps' if vps == '1' else 'pc'}", f"{algo}|{now.isoformat()}")
     ok, _ = executor.state()
     if not ok or algo == "0":
         # Algo Trading av i MT5: ordren blir liggende i køen til den slås på
