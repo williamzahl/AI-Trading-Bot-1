@@ -34,7 +34,7 @@ def _num(name: str, default: float) -> float:
 # AUTO_TRADE=on: trend-signaler sendes rett til MT5 uten APPROVE/REJECT i Telegram
 AUTO_TRADE = os.getenv("AUTO_TRADE", "on").strip().lower() in ("on", "true", "1")
 # Navnet paa aktiv strategi, vises i /status. Endres i Render (STRATEGY).
-STRATEGY = os.getenv("STRATEGY", "").strip() or "5M SMT NAS100/US500 + 24t trendfilter"
+STRATEGY = os.getenv("STRATEGY", "").strip() or "5M SMT (NAS100) + 24t trendfilter"
 # Noedstopp: ingen ordre sendes uten EXECUTION_ENABLED=on
 EXECUTION_ENABLED = os.getenv("EXECUTION_ENABLED", "off").strip().lower() in ("on", "true", "1")
 # "metaapi" = Render sender ordren via MetaApi.cloud
@@ -69,8 +69,8 @@ def _buffer_map(raw: str) -> dict[str, float]:
 
 
 # Ekstra avstand (i pris/punkter) under SMT-low / over SMT-high, per symbol.
-# Endres i Render uten aa bytte EA, f.eks. SL_BUFFER=NAS100:10,US500:3
-SL_BUFFER = _buffer_map(os.getenv("SL_BUFFER", "") or "NAS100:7,US500:2")
+# Endres i Render uten aa bytte EA, f.eks. SL_BUFFER=NAS100:10
+SL_BUFFER = _buffer_map(os.getenv("SL_BUFFER", "") or "NAS100:7")
 
 
 def sl_buffer(symbol: str) -> float:
@@ -82,7 +82,7 @@ MAX_LOT = _num("MAX_LOT", 20)                      # sikkerhetstak paa lot
 MAX_SL_PCT = _num("MAX_SL_PCT", 1.0)               # hopp over trade hvis SL er lenger unna enn dette (%)
 MAX_OPEN_POSITIONS = int(_num("MAX_OPEN_POSITIONS", 1))
 MAX_SIGNAL_AGE_MIN = _num("MAX_SIGNAL_AGE_MIN", 15)
-ALLOWED_SYMBOLS = [x.strip().upper() for x in os.getenv("ALLOWED_SYMBOLS", "NAS100,US500").split(",") if x.strip()]
+ALLOWED_SYMBOLS = [x.strip().upper() for x in os.getenv("ALLOWED_SYMBOLS", "NAS100").split(",") if x.strip()]
 MT5_SYMBOL_SUFFIX = os.getenv("MT5_SYMBOL_SUFFIX", "").strip()
 # TradingView-navn -> MT5-navn
 SYMBOL_MAP = {"US100": "NAS100", "USTEC": "NAS100", "SPX500": "US500"}
