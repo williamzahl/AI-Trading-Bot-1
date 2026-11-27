@@ -9,6 +9,10 @@ Webhook-mottaker for TradingView-varsler. Kjoerer paa Render (Oregon) med Postgr
 - `POST /telegram/webhook` - tar imot knappetrykk og kommandoer fra Telegram
 
 ## Telegram
+Med `AUTO_TRADE=on` (standard) handles trend-signaler automatisk, uten knapper. Telegram
+varsler: signal mottatt, trade tatt eller hoppet over (med grunn), entry/SL/TP, og
+resultatet naar traden lukkes. Sett `AUTO_TRADE=off` for aa faa APPROVE/REJECT tilbake.
+
 Sett `TELEGRAM_BOT_TOKEN` i Render. Foerste chat som sender `/start` til boten blir eier
 (eller sett `TELEGRAM_CHAT_ID`). Hvert signal sendes dit med APPROVE/REJECT; valget lagres
 i `status` og `decided_at`. `/siste` viser de 5 siste signalene.

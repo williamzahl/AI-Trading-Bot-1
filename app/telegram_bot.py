@@ -83,11 +83,14 @@ def signal_text(sig: Signal) -> str:
         chg_txt = f" ({chg:+.2f}% 24t)" if isinstance(chg, (int, float)) else ""
         lines.append(f"Trend: {trend}{chg_txt}")
         if raw.get("trend_aligned") is False:
-            lines.append("⚠️ Mot trend / ingen trend: kun info, ingen knapper")
+            lines.append("⚠️ Mot trend / ingen trend: kun info, ingen trade")
     if sig.status not in ("NEW", "INFO"):
         d = sig.decided_at.strftime("%H:%M:%S UTC") if sig.decided_at else ""
-        mark = "✅ GODKJENT" if sig.status == "APPROVED" else "❌ AVVIST"
-        lines.append(f"\n<b>{mark}</b> {d}")
+        if sig.status == "APPROVED" and config.AUTO_TRADE:
+            lines.append("\n🤖 <b>Auto-handel:</b> sendes til MT5")
+        else:
+            mark = "✅ GODKJENT" if sig.status == "APPROVED" else "❌ AVVIST"
+            lines.append(f"\n<b>{mark}</b> {d}")
     return "\n".join(lines)
 
 
@@ -110,12 +113,19 @@ async def notify_signal(sig_id: int) -> None:
         sig = s.get(Signal, sig_id)
         if not sig:
             return
-        extra = {} if sig.status == "INFO" else {"reply_markup": _keyboard(sig.id)}
+        auto = sig.status == "NEW" and config.AUTO_TRADE
+        if auto:
+            sig.status = "APPROVED"
+            sig.decided_at = datetime.now(timezone.utc)
+            s.commit()
+        extra = {"reply_markup": _keyboard(sig.id)} if sig.status == "NEW" else {}
         res = await call("sendMessage", chat_id=chat, text=signal_text(sig),
                          parse_mode="HTML", **extra)
         if res.get("ok"):
             sig.telegram_message_id = res["result"]["message_id"]
             s.commit()
+    if auto:
+        await _execute_and_report(sig_id, chat, sig.telegram_message_id)
 
 
 async def handle_update(update: dict) -> None:
@@ -237,10 +247,15 @@ async def _handle_callback(cq: dict) -> None:
         task.add_done_callback(_tasks.discard)
 
 
-async def _execute_and_report(sig_id: int, chat_id: str, reply_to: int) -> None:
+async def _execute_and_report(sig_id: int, chat_id: str, reply_to: int | None) -> None:
     try:
         text = await executor.execute_signal(sig_id)
     except Exception as e:
         log.exception("Ordre for #%s krasjet", sig_id)
         text = f"⚠️ Ordre for #{sig_id} feilet: {e}"[:400]
-    await call("sendMessage", chat_id=chat_id, text=text, reply_to_message_id=reply_to)
+    with SessionLocal() as s:
+        sig = s.get(Signal, sig_id)
+        if sig and sig.exec_status == "QUEUED":
+            return  # EA-en henter ordren; resultatet meldes naar den er utfoert
+    extra = {"reply_to_message_id": reply_to} if reply_to else {}
+    await call("sendMessage", chat_id=chat_id, text=text, **extra)
