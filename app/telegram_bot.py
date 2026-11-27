@@ -109,8 +109,8 @@ def signal_text(sig: Signal) -> str:
 
 def mode_text() -> str:
     if config.AUTO_TRADE:
-        return "Modus: 🤖 AUTOMATISK. Trend-signaler handles uten APPROVE, du får bare varsler"
-    return "Modus: ✋ MANUELL. Hvert signal må godkjennes med APPROVE"
+        return "Modus: 🤖 Automatisk"
+    return "Modus: ✋ Manuell (APPROVE)"
 
 
 def _keyboard(sig_id: int) -> dict:
@@ -191,37 +191,38 @@ async def _handle_message(msg: dict) -> None:
 
     if text.startswith("/status"):
         ok, why = executor.state()
-        lines = [f"Handel: {why}",
-                 mode_text(),
-                 (f"Risiko: {config.RISK_USD:g} $ per trade -> mål {config.RISK_USD * config.RISK_REWARD:g} $ "
-                  f"(1:{config.RISK_REWARD:g}). Lot regnes ut automatisk"
-                  if config.RISK_USD > 0 and executor.ea_mode()
-                  else f"Lot: {config.TRADE_LOT} | SL {config.STOP_LOSS_PCT}% | TP {config.TAKE_PROFIT_PCT}%"),
-                 (f"SL: under laveste low / over høyeste high siste {config.SL_LOOKBACK_BARS} 5M-lys "
-                  f"+ {config.SL_BUFFER_POINTS:g} punkter" if executor.ea_mode() else ""),
-                 f"Maks åpne posisjoner: {config.MAX_OPEN_POSITIONS} | Symboler: {', '.join(config.ALLOWED_SYMBOLS)}"]
+        handel = "PÅ ✅" if ok else f"⛔ {why}"
+        modus = "🤖 Automatisk" if config.AUTO_TRADE else "✋ Manuell (APPROVE)"
+        lines = [f"Handel: {handel}", f"Modus: {modus}", ""]
+        if executor.ea_mode() and config.RISK_USD > 0:
+            minutes = config.SL_LOOKBACK_BARS * 5
+            lines += [f"Risiko: {config.RISK_USD:g} $ → Mål: {config.RISK_USD * config.RISK_REWARD:g} $ "
+                      f"(1:{config.RISK_REWARD:g})",
+                      f"SL: {config.SL_BUFFER_POINTS:g} pkt bak siste {minutes} min low/high",
+                      "Lot: regnes ut automatisk"]
+        else:
+            lines += [f"Lot: {config.TRADE_LOT:g}",
+                      f"SL: {config.STOP_LOSS_PCT:g} %  |  TP: {config.TAKE_PROFIT_PCT:g} %"]
+        lines += ["", f"Symboler: {', '.join(config.ALLOWED_SYMBOLS)}",
+                  f"Maks åpne: {config.MAX_OPEN_POSITIONS}", ""]
         if executor.ea_mode():
             from app import ea_bridge
             seen = ea_bridge.last_seen_seconds()
-            acc = get_setting("ea_account") or "?"
             if seen is None:
-                lines.append("MT5-EA: har aldri kontaktet Render")
+                lines.append("MT5-EA: 🔴 aldri sett")
+            elif seen < 60:
+                lines.append(f"MT5-EA: 🟢 ({seen:.0f} sek siden)")
             else:
-                mark = "🟢" if seen < 60 else "🔴"
-                lines.append(f"MT5-EA {mark} sist sett for {seen:.0f} sek siden (konto {acc})")
+                ago = f"{seen / 60:.0f} min" if seen < 3600 else f"{seen / 3600:.1f} t"
+                lines.append(f"MT5-EA: 🔴 ({ago} siden)")
         elif executor.configured():
             try:
                 acc = await executor.account_info()
                 pos = await executor.open_positions()
-                lines.append(f"MT5: {acc.get('login') or acc.get('name', '')} {acc.get('type', '')}")
-                lines.append(f"Balanse {acc.get('balance')} {acc.get('currency', '')} | Equity {acc.get('equity')}")
-                lines.append(f"Åpne posisjoner: {len(pos)}")
-                for p in pos[:5]:
-                    lines.append(f"  {p.get('type', '')[14:]} {p.get('volume')} {p.get('symbol')} "
-                                 f"@ {p.get('openPrice')} P/L {p.get('profit')}")
+                lines.append(f"MT5: {acc.get('balance')} {acc.get('currency', '')}  |  Åpne: {len(pos)}")
             except Exception as e:
-                lines.append(f"⚠️ Fikk ikke kontakt med MetaApi: {e}"[:300])
-        await call("sendMessage", chat_id=chat_id, text="\n".join(l for l in lines if l))
+                lines.append(f"MT5: 🔴 ingen kontakt ({e})"[:200])
+        await call("sendMessage", chat_id=chat_id, text="\n".join(lines).strip())
         return
 
     if text.startswith("/siste"):
