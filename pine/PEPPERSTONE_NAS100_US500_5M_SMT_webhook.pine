@@ -1,5 +1,5 @@
 //@version=6
-indicator("Pepperstone NAS100 / US500 5M SMT", overlay=true, max_lines_count=500, dynamic_requests=true)
+indicator("Pepperstone NAS100 / US500 5M SMT", overlay=true, max_lines_count=500, dynamic_requests=true, max_bars_back=500)
 // CFD version of the MNQ/MES 5M SMT indicator, built for Pepperstone's feed so
 // the TradingView signal matches the prices in the Pepperstone MT5 account.
 // Use it on a PEPPERSTONE:NAS100 or PEPPERSTONE:US500 chart (5M or lower for drawings).
@@ -106,10 +106,16 @@ if barstate.isfirst and na(chartSeconds)
 // Trend-bias (24t) for webhook/Telegram-filter
 //====================================================
 string GROUP_BIAS = "Trend bias (24h)"
-float biasThresholdPct = input.float(1.0, "Trend threshold 24h (%)", minval=0.0, maxval=10.0, step=0.1, group=GROUP_BIAS,
+float biasThresholdPct = input.float(0.5, "Trend threshold 24h (%)", minval=0.0, maxval=10.0, step=0.1, group=GROUP_BIAS,
      tooltip="Change over ~24h on NAS100 (hourly bars). Above +threshold = UP, below -threshold = DOWN, otherwise NONE.")
 int biasLookbackBars = input.int(23, "Bias lookback (hourly bars)", minval=1, maxval=200, group=GROUP_BIAS,
      tooltip="The CFDs trade about 23 hours a day, so 23 hourly bars is roughly 24 hours.")
+string trendMode = input.string("Hide counter-trend", "Trend filter for SMT lines and alerts",
+     options=["Hide counter-trend", "Grey counter-trend", "Off"], group=GROUP_BIAS,
+     tooltip="Hide counter-trend = a bullish SMT in a DOWN trend or a bearish SMT in an UP trend is neither drawn nor alerted. Grey = drawn in grey (alert follows the INFO setting below). SMTs with no trend (NONE) are drawn in grey. Off = everything drawn in normal colors.")
+int trendLookbackBars = input.int(12, "With-trend pullback: swing must be extreme of last N 5M bars", minval=0, maxval=300, group=GROUP_BIAS,
+     tooltip="In an UP trend a swing low (and in a DOWN trend a swing high) is a pullback, so it only has to be the lowest low / highest high of the last N 5M bars (12 = 1 hour) instead of the stricter major-swing setting, and the mid-range filter is skipped. Gives more SMTs in the trend's direction.")
+color greyColor = input.color(color.gray, "Counter-trend / no-trend color", group=GROUP_BIAS)
 bool sendCounterTrend = input.bool(true, "Also alert counter-trend SMT (sent as INFO)", group=GROUP_BIAS,
      tooltip="Off = bearish SMT in an UP trend and bullish SMT in a DOWN trend (and all SMT with no trend) are not alerted at all.")
 [biasNowPrice, biasRefPrice] = request.security(nasSymbol, "60", [close, close[biasLookbackBars]], lookahead=barmerge.lookahead_off)
@@ -180,6 +186,7 @@ type SourceCandle
     float lowValue
 type DrawSmt
     bool bullish
+    bool muted
     int eventId
     int x1
     float y1
@@ -223,22 +230,34 @@ f_sourceBundle(int drawingStrength, int alertStrength, bool includeHighPivots, b
         alertSwingLow := ta.pivotlow(low, alertLeftBars, alertStrength)
     // Major swing filter: the pivot must be the extreme of the last N candles
     // before it (plus its own pivot window).
+    // Trend of this market over ~24h (same idea as the webhook bias): a swing
+    // low in an UP trend (or a swing high in a DOWN trend) is a with-trend
+    // pullback and gets the looser pullback lookback instead.
+    float trendRefClose = close[math.max(1, biasLookbackBars * 12)]
+    float trendPct = not na(trendRefClose) and trendRefClose != 0 ? 100.0 * (close - trendRefClose) / trendRefClose : na
+    bool trendUp = not na(trendPct) and trendPct >= biasThresholdPct
+    bool trendDown = not na(trendPct) and trendPct <= -biasThresholdPct
+    bool lowWithTrend = trendUp and trendMode != "Off"
+    bool highWithTrend = trendDown and trendMode != "Off"
     float majorLow = ta.lowest(low, drawingStrength + majorLookbackBars + 1)
     float majorHigh = ta.highest(high, drawingStrength + majorLookbackBars + 1)
-    if majorLookbackBars > 0
-        if not na(swingLow) and swingLow > majorLow
-            swingLow := na
-        if not na(swingHigh) and swingHigh < majorHigh
-            swingHigh := na
+    float pullbackLow = ta.lowest(low, drawingStrength + trendLookbackBars + 1)
+    float pullbackHigh = ta.highest(high, drawingStrength + trendLookbackBars + 1)
+    int lowLookback = lowWithTrend ? trendLookbackBars : majorLookbackBars
+    int highLookback = highWithTrend ? trendLookbackBars : majorLookbackBars
+    if lowLookback > 0 and not na(swingLow) and swingLow > (lowWithTrend ? pullbackLow : majorLow)
+        swingLow := na
+    if highLookback > 0 and not na(swingHigh) and swingHigh < (highWithTrend ? pullbackHigh : majorHigh)
+        swingHigh := na
     // Not mid-range: the swing must sit near the top (high) or bottom (low)
     // of the last rangeBars candles.
     float rangeTop = ta.highest(high, math.max(1, rangeBars))
     float rangeBottom = ta.lowest(low, math.max(1, rangeBars))
     float rangeSize = rangeTop - rangeBottom
     if rangeBars > 0 and rangeEdgePct < 100 and not na(rangeSize) and rangeSize > 0
-        if not na(swingHigh) and (swingHigh - rangeBottom) / rangeSize < 1.0 - rangeEdgePct / 100.0
+        if not highWithTrend and not na(swingHigh) and (swingHigh - rangeBottom) / rangeSize < 1.0 - rangeEdgePct / 100.0
             swingHigh := na
-        if not na(swingLow) and (rangeTop - swingLow) / rangeSize < 1.0 - rangeEdgePct / 100.0
+        if not lowWithTrend and not na(swingLow) and (rangeTop - swingLow) / rangeSize < 1.0 - rangeEdgePct / 100.0
             swingLow := na
     // Key levels on the New York clock. Trading day starts with Asia (18:00 NY).
     int nyMinute = hour(time, "America/New_York") * 60 + minute(time, "America/New_York")
@@ -739,7 +758,7 @@ f_renderDraw(DrawSmt drawing, array<line> lines, array<string> keys,
         if latestOnly
             while array.size(lines) > 0
                 line.delete(array.shift(lines))
-        color baseColor = drawing.bullish ? bullColor : bearColor
+        color baseColor = drawing.muted ? greyColor : drawing.bullish ? bullColor : bearColor
         line id = line.new(x1=drawing.x1, y1=drawing.y1, x2=drawing.x2, y2=drawing.y2,
              xloc=xloc.bar_time, extend=extend.none, color=color.new(baseColor, transparency), width=width)
         array.push(lines, id)
@@ -1099,8 +1118,14 @@ if canRunEngine
                                 array.shift(processedEventKeys)
                             bearishSignalCount += 1
                             debugSignalStatus := "BEARISH SMT confirmed: " + (bearNASSwept ? "NAS swept high; SPX held" : "SPX swept high; NAS held")
+                            // Trend filter: the drawing and the alert follow the same decision.
+                            bool bearCounter = trendMode != "Off" and bias24State == "UP"
+                            bool bearMuted = trendMode != "Off" and bias24State != "DOWN"
+                            bool bearHidden = trendMode == "Hide counter-trend" and bearCounter
+                            if bearHidden
+                                debugSignalStatus := debugSignalStatus + " (hidden: counter-trend)"
                             // The drawing and the alert share this one validated event.
-                            if enableAlerts and enableBearishAlerts and not array.includes(alertProcessedKeys, eventKey)
+                            if not bearHidden and enableAlerts and enableBearishAlerts and not array.includes(alertProcessedKeys, eventKey)
                                 array.push(alertProcessedKeys, eventKey)
                                 while array.size(alertProcessedKeys) > 512
                                     array.shift(alertProcessedKeys)
@@ -1108,8 +1133,8 @@ if canRunEngine
                             int lineStartTime = drawUsingNASPrices ? bearRefNASTime : bearRefSPXTime
                             float lineStartPrice = drawUsingNASPrices ? bearRefNASPrice : bearRefSPXPrice
                             float lineEndPrice = drawUsingNASPrices ? bearEndNASPrice : bearEndSPXPrice
-                            if showHistoricalLines and drawingsVisible and showBearishLines
-                                DrawSmt drawing = DrawSmt.new(false, nasClose, lineStartTime, lineStartPrice, bearSweepTime, lineEndPrice)
+                            if not bearHidden and showHistoricalLines and drawingsVisible and showBearishLines
+                                DrawSmt drawing = DrawSmt.new(false, bearMuted, nasClose, lineStartTime, lineStartPrice, bearSweepTime, lineEndPrice)
                                 f_recordDraw(historicalDraws, pendingDraws, drawing, maximumHistoricalSignals, showOnlyLatest, barstate.ishistory)
                     else if bearDivergedCount > 0
                         debugSignalStatus := "Bearish sweep not confirmed: " + bearReason
@@ -1143,8 +1168,14 @@ if canRunEngine
                                 array.shift(processedEventKeys)
                             bullishSignalCount += 1
                             debugSignalStatus := "BULLISH SMT confirmed: " + (bullNASSwept ? "NAS swept low; SPX held" : "SPX swept low; NAS held")
+                            // Trend filter: the drawing and the alert follow the same decision.
+                            bool bullCounter = trendMode != "Off" and bias24State == "DOWN"
+                            bool bullMuted = trendMode != "Off" and bias24State != "UP"
+                            bool bullHidden = trendMode == "Hide counter-trend" and bullCounter
+                            if bullHidden
+                                debugSignalStatus := debugSignalStatus + " (hidden: counter-trend)"
                             // The drawing and the alert share this one validated event.
-                            if enableAlerts and enableBullishAlerts and not array.includes(alertProcessedKeys, eventKey)
+                            if not bullHidden and enableAlerts and enableBullishAlerts and not array.includes(alertProcessedKeys, eventKey)
                                 array.push(alertProcessedKeys, eventKey)
                                 while array.size(alertProcessedKeys) > 512
                                     array.shift(alertProcessedKeys)
@@ -1152,8 +1183,8 @@ if canRunEngine
                             int lineStartTime = drawUsingNASPrices ? bullRefNASTime : bullRefSPXTime
                             float lineStartPrice = drawUsingNASPrices ? bullRefNASPrice : bullRefSPXPrice
                             float lineEndPrice = drawUsingNASPrices ? bullEndNASPrice : bullEndSPXPrice
-                            if showHistoricalLines and drawingsVisible and showBullishLines
-                                DrawSmt drawing = DrawSmt.new(true, nasClose, lineStartTime, lineStartPrice, bullSweepTime, lineEndPrice)
+                            if not bullHidden and showHistoricalLines and drawingsVisible and showBullishLines
+                                DrawSmt drawing = DrawSmt.new(true, bullMuted, nasClose, lineStartTime, lineStartPrice, bullSweepTime, lineEndPrice)
                                 f_recordDraw(historicalDraws, pendingDraws, drawing, maximumHistoricalSignals, showOnlyLatest, barstate.ishistory)
                     else if bullDivergedCount > 0
                         debugSignalStatus := "Bullish sweep not confirmed: " + bullReason
