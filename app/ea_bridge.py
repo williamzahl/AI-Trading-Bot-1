@@ -142,6 +142,8 @@ async def record_result(sig_id: int, ok: bool, ticket: str, price: str, sl: str,
             r = _f(risk)
             risk_line = (f"Risiko: {r:.0f} $  ->  Mål: {r * config.RISK_REWARD:.0f} $ "
                          f"(1:{config.RISK_REWARD:g})\n") if r else ""
+            if r and config.RISK_USD > 0 and r < config.RISK_USD * 0.9:
+                risk_line = "⚠️ Risiko redusert (margin/maks lot): " + risk_line
             text = (f"✅ TRADE TATT #{sig.id}\n"
                     f"{icon} {sig.signal} {sig.exec_lot:g} lot {symbol}\n"
                     f"Entry: {price}\nSL: {sl}\nTP: {tp}\n{risk_line}"
