@@ -8,7 +8,7 @@
 //|   - legg til https://smt-webhook-4dgq.onrender.com               |
 //+------------------------------------------------------------------+
 #property copyright "SMT Bot"
-#property version   "1.20"
+#property version   "1.30"
 #property strict
 
 #include <Trade/Trade.mqh>
@@ -208,6 +208,7 @@ void OnTimer()
    double buffer  = StringToDouble(Field(body, "buffer"));
    double maxLot  = StringToDouble(Field(body, "max_lot"));
    double maxSlPct= StringToDouble(Field(body, "max_sl_pct"));
+   double smtLevel= StringToDouble(Field(body, "smt_level"));
    int    maxPos  = (int)StringToInteger(Field(body, "max_pos"));
    if(rr <= 0) rr = 3;
    if(lookback <= 0) lookback = 6;
@@ -230,10 +231,19 @@ void OnTimer()
    double price = buy ? tick.ask : tick.bid;
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
 
-   // SL ALLTID under laveste low (kjoep) / over hoeyeste high (salg) paa 5M,
-   // inkludert lyset som er under dannelse, pluss en liten buffer.
+   // SL ALLTID under lowen (kjoep) / over highen (salg) paa lyset som dannet SMT-en,
+   // pluss en liten buffer. Mangler nivaaet (gammelt varsel), brukes laveste low /
+   // hoeyeste high paa 5M de siste lysene som reserve.
    double sl;
-   if(buy)
+   if(smtLevel > 0)
+     {
+      if(buy && tick.bid <= smtLevel)
+        { Report(id, false, "", price, 0, 0, "SKIP: prisen er allerede under SMT-lowen " + DoubleToString(smtLevel, digits), digits); return; }
+      if(!buy && tick.ask >= smtLevel)
+        { Report(id, false, "", price, 0, 0, "SKIP: prisen er allerede over SMT-highen " + DoubleToString(smtLevel, digits), digits); return; }
+      sl = buy ? smtLevel - buffer : smtLevel + buffer;
+     }
+   else if(buy)
      {
       int idx = iLowest(symbol, PERIOD_M5, MODE_LOW, lookback, 0);
       if(idx < 0) { Report(id, false, "", price, 0, 0, "Fant ikke 5M-lows for SL", digits); return; }

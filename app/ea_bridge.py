@@ -35,6 +35,13 @@ async def _tell(sig: Signal, text: str) -> None:
     await telegram_bot.call("sendMessage", chat_id=chat, text=text, **extra)
 
 
+def _smt_level(sig: Signal) -> str:
+    """Low (kjoep) / high (salg) paa lyset som dannet SMT-en, sendt fra TradingView."""
+    raw = sig.raw if isinstance(sig.raw, dict) else {}
+    v = _f(raw.get("smt_level"))
+    return repr(v) if v else ""
+
+
 async def next_order(account: str = "") -> str:
     """Neste ordre som tekst, eller 'NONE'."""
     now = datetime.now(timezone.utc)
@@ -72,11 +79,11 @@ async def next_order(account: str = "") -> str:
                     f"max_pos={config.MAX_OPEN_POSITIONS};risk_usd={config.RISK_USD};"
                     f"rr={config.RISK_REWARD};lookback={config.SL_LOOKBACK_BARS};"
                     f"buffer={config.SL_BUFFER_POINTS};max_lot={config.MAX_LOT};"
-                    f"max_sl_pct={config.MAX_SL_PCT}")
+                    f"max_sl_pct={config.MAX_SL_PCT};smt_level={_smt_level(sig)}")
     return "NONE"
 
 
-_NO = {"aapne": "åpne", "slaatt": "slått", "utfoert": "utført", "maa": "må", "paa": "på"}
+_NO = {"aapne": "åpne", "slaatt": "slått", "utfoert": "utført", "maa": "må", "paa": "på", "naermere": "nærmere"}
 
 
 def _norsk(text: str) -> str:

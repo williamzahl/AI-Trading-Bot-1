@@ -90,6 +90,9 @@ def signal_text(sig: Signal) -> str:
     if msg:
         lines.insert(2, f"Melding: {html.escape(msg[:500])}")
     raw = sig.raw if isinstance(sig.raw, dict) else {}
+    lvl = raw.get("smt_level")
+    if isinstance(lvl, (int, float)):
+        lines.append(f"SMT-{'low' if side in ('BUY', 'LONG') else 'high'}: {_fmt_price(lvl)}")
     if "bias" in raw:
         trend = {"UP": "OPP 📈", "DOWN": "NED 📉"}.get(raw["bias"], "INGEN ➖")
         chg = raw.get("change_24h_pct")
@@ -195,10 +198,9 @@ async def _handle_message(msg: dict) -> None:
         modus = "🤖 Automatisk" if config.AUTO_TRADE else "✋ Manuell (APPROVE)"
         lines = [f"Handel: {handel}", f"Modus: {modus}", ""]
         if executor.ea_mode() and config.RISK_USD > 0:
-            minutes = config.SL_LOOKBACK_BARS * 5
             lines += [f"Risiko: {config.RISK_USD:g} $ → Mål: {config.RISK_USD * config.RISK_REWARD:g} $ "
                       f"(1:{config.RISK_REWARD:g})",
-                      f"SL: {config.SL_BUFFER_POINTS:g} pkt bak siste {minutes} min low/high",
+                      f"SL: {config.SL_BUFFER_POINTS:g} pkt under SMT-low / over SMT-high",
                       "Lot: regnes ut automatisk"]
         else:
             lines += [f"Lot: {config.TRADE_LOT:g}",
