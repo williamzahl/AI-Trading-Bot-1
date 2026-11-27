@@ -51,7 +51,31 @@ TAKE_PROFIT_PCT = _num("TAKE_PROFIT_PCT", 0.5)     # TP-avstand i % av prisen
 RISK_USD = _num("RISK_USD", 250)
 RISK_REWARD = _num("RISK_REWARD", 3)               # TP = 3 x SL-avstand
 SL_LOOKBACK_BARS = int(_num("SL_LOOKBACK_BARS", 6))  # reserve hvis varselet mangler smt_level
-SL_BUFFER_POINTS = _num("SL_BUFFER_POINTS", 1)     # ekstra avstand under SMT-low / over SMT-high (i pris)
+SL_BUFFER_POINTS = _num("SL_BUFFER_POINTS", 7)     # reserve-buffer for symboler som ikke staar i SL_BUFFER
+
+
+def _buffer_map(raw: str) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for part in raw.split(","):
+        if ":" in part:
+            k, v = part.split(":", 1)
+            try:
+                out[k.strip().upper()] = float(v)
+            except ValueError:
+                pass
+    return out
+
+
+# Ekstra avstand (i pris/punkter) under SMT-low / over SMT-high, per symbol.
+# Endres i Render uten aa bytte EA, f.eks. SL_BUFFER=NAS100:10,US500:3
+SL_BUFFER = _buffer_map(os.getenv("SL_BUFFER", "") or "NAS100:7,US500:2")
+
+
+def sl_buffer(symbol: str) -> float:
+    sym = symbol.upper()
+    if MT5_SYMBOL_SUFFIX and sym.endswith(MT5_SYMBOL_SUFFIX.upper()):
+        sym = sym[: -len(MT5_SYMBOL_SUFFIX)]
+    return SL_BUFFER.get(sym, SL_BUFFER_POINTS)
 MAX_LOT = _num("MAX_LOT", 20)                      # sikkerhetstak paa lot
 MAX_SL_PCT = _num("MAX_SL_PCT", 1.0)               # hopp over trade hvis SL er lenger unna enn dette (%)
 MAX_OPEN_POSITIONS = int(_num("MAX_OPEN_POSITIONS", 1))
