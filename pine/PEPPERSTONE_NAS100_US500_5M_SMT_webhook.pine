@@ -456,11 +456,12 @@ f_previousBundle(SourceBundle source) =>
     SourceBundle previous = na
     if not na(source)
         if not na(source.prevSourceTime) and not na(source.prevSourceClose)
-            previous := SourceBundle.new(source.prevHighValue, source.prevLowValue, source.prevCloseValue,
-                 source.prevSourceTime, source.prevSourceClose, source.tickSize,
-                 source.prevPivotHigh, source.prevPivotHighTime, source.prevPivotLow, source.prevPivotLowTime,
-                 na, na, na, na, source.prevAtrValue,
-                 source.prevMagnetAbove1, source.prevMagnetAbove2, source.prevMagnetBelow1, source.prevMagnetBelow2)
+            previous := SourceBundle.new(highValue=source.prevHighValue, lowValue=source.prevLowValue,
+                 closeValue=source.prevCloseValue, sourceTime=source.prevSourceTime, sourceClose=source.prevSourceClose,
+                 tickSize=source.tickSize, pivotHigh=source.prevPivotHigh, pivotHighTime=source.prevPivotHighTime,
+                 pivotLow=source.prevPivotLow, pivotLowTime=source.prevPivotLowTime, atrValue=source.prevAtrValue,
+                 magnetAbove1=source.prevMagnetAbove1, magnetAbove2=source.prevMagnetAbove2,
+                 magnetBelow1=source.prevMagnetBelow1, magnetBelow2=source.prevMagnetBelow2)
     previous
 // Most extreme high (highSide) or low after afterTime, earliest candle on ties.
 f_extremeAfter(array<SourceCandle> candles, int afterTime, bool highSide) =>
