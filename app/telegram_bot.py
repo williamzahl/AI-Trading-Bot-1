@@ -200,7 +200,8 @@ async def _handle_message(msg: dict) -> None:
         if executor.ea_mode() and config.RISK_USD > 0:
             lines += [f"Risiko: {config.RISK_USD:g} $ → Mål: {config.RISK_USD * config.RISK_REWARD:g} $ "
                       f"(1:{config.RISK_REWARD:g})",
-                      f"SL: {config.SL_BUFFER_POINTS:g} pkt under SMT-low / over SMT-high",
+                      "SL: under SMT-low / over SMT-high, pluss",
+                      *[f"   {sym}: {config.sl_buffer(sym):g} pkt" for sym in config.ALLOWED_SYMBOLS],
                       "Lot: regnes ut automatisk"]
         else:
             lines += [f"Lot: {config.TRADE_LOT:g}",
