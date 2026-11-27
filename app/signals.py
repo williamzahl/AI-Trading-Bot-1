@@ -3,6 +3,7 @@
 Nye indikatorer trenger ingen kodeendring saa lenge varselet sender JSON med
 feltene under. Ekstra felt lagres uansett i `raw`.
 """
+from app import config
 from app.db import SessionLocal
 from app.models import Signal
 
@@ -77,17 +78,28 @@ def normalize(data: dict) -> dict:
     return data
 
 
+def is_test_1m(data: dict) -> bool:
+    """Signal fra 1M-testindikatoren (f.eks. SMT_PEPPERSTONE_1M_TEST, timeframe 1)."""
+    ind = str(_first(data, "indicator", "strategy") or "").upper()
+    tf = str(_first(data, "timeframe", "interval") or "").strip()
+    return "1M_TEST" in ind or (tf == "1" and "TEST" in ind)
+
+
 def _initial_status(data: dict) -> str:
     """NEW = faar APPROVE/REJECT-knapper. INFO = bare informasjon."""
     if str(_first(data, "signal", "action", "side") or "").upper() == "INFO":
         return "INFO"
     if data.get("trend_aligned") is False:  # signal mot trend / ingen trend
+        if config.TEST_IGNORE_TREND_1M and is_test_1m(data):
+            data["test_ignore_trend"] = True
+            return "NEW"
         return "INFO"
     return "NEW"
 
 
 def save_signal(data: dict, source_ip: str | None) -> Signal:
     data = normalize(data)
+    status = _initial_status(data)  # kan legge til test_ignore_trend i data
     clean = {k: v for k, v in data.items() if k != "secret"}  # lagre aldri noekkelen
     sig = Signal(
         instrument=_first(data, "instrument", "ticker", "symbol"),
@@ -97,7 +109,7 @@ def save_signal(data: dict, source_ip: str | None) -> Signal:
         timeframe=_first(data, "timeframe", "interval"),
         bar_time=_first(data, "time", "bar_time"),
         source_ip=source_ip,
-        status=_initial_status(data),
+        status=status,
         raw=clean,
     )
     with SessionLocal() as s:

@@ -98,7 +98,9 @@ def signal_text(sig: Signal) -> str:
         chg = raw.get("change_24h_pct")
         chg_txt = f" ({chg:+.2f}% 24t)" if isinstance(chg, (int, float)) else ""
         lines.append(f"Trend: {trend}{chg_txt}")
-        if raw.get("trend_aligned") is False:
+        if raw.get("test_ignore_trend"):
+            lines.append("🧪 TEST (1M): trendfilter av, handles likevel")
+        elif raw.get("trend_aligned") is False:
             lines.append("⚠️ Mot trend / ingen trend: kun info, ingen trade")
     if sig.status not in ("NEW", "INFO"):
         d = oslo(sig.decided_at, "%H:%M:%S") if sig.decided_at else ""
