@@ -59,8 +59,8 @@ def state() -> tuple[bool, str]:
             return False, "AV (MT5_EA_KEY mangler i Render)"
         return False, "AV (METAAPI_TOKEN eller METAAPI_ACCOUNT_ID mangler)"
     if paused():
-        return False, "PAUSET (/stopp i Telegram). Skriv /handel_paa for aa starte igjen"
-    return True, "PAA"
+        return False, "PAUSET (/stopp i Telegram). Skriv /handel_paa for å starte igjen"
+    return True, "PÅ"
 
 
 # ---------- MetaApi ----------
@@ -126,7 +126,7 @@ def build_order(sig: Signal, symbol: str, ref_price: float) -> dict:
     sl = round(ref_price * config.STOP_LOSS_PCT / 100, 2)
     tp = round(ref_price * config.TAKE_PROFIT_PCT / 100, 2)
     if sl <= 0 or tp <= 0:
-        raise ExecError("SL/TP maa vaere stoerre enn 0")
+        raise ExecError("SL/TP må være større enn 0")
     return {
         "actionType": "ORDER_TYPE_BUY" if side == "BUY" else "ORDER_TYPE_SELL",
         "symbol": symbol,
@@ -172,18 +172,18 @@ async def execute_signal(sig_id: int) -> str:
             if ea_mode():
                 # EA-en i MT5 henter ordren selv og sjekker aapne posisjoner der.
                 status = "QUEUED"
-                raise ExecError(f"📨 Ordre #{sig.id} {sig.signal} {symbol} lagt i koe. "
-                                "Venter paa at MT5 (EA) henter den...")
+                raise ExecError(f"📨 Ordre #{sig.id} {sig.signal} {symbol} lagt i kø. "
+                                "Venter på at MT5 (EA) henter den...")
 
             positions = await open_positions()
             if len(positions) >= config.MAX_OPEN_POSITIONS:
-                raise ExecError(f"Har allerede {len(positions)} aapne posisjoner (maks {config.MAX_OPEN_POSITIONS}).")
+                raise ExecError(f"Har allerede {len(positions)} åpne posisjoner (maks {config.MAX_OPEN_POSITIONS}).")
 
             price = await _api("GET", f"/symbols/{symbol}/current-price")
             ref = price.get("ask") if (sig.signal or "").upper() == "BUY" else price.get("bid")
             ref = ref or sig.price
             if not ref:
-                raise ExecError("Fant ingen pris aa regne SL/TP fra.")
+                raise ExecError("Fant ingen pris å regne SL/TP fra.")
 
             order = build_order(sig, symbol, float(ref))
             status = "FAILED"

@@ -4,6 +4,7 @@ import hashlib
 import html
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -57,6 +58,18 @@ async def setup_webhook() -> None:
     log.info("Telegram-webhook satt: %s", res.get("ok"))
 
 
+OSLO = ZoneInfo("Europe/Oslo")
+
+
+def oslo(dt: datetime | None, fmt: str = "%d.%m.%Y %H:%M:%S") -> str:
+    """Vis tid i norsk tid (tar hensyn til sommertid)."""
+    if not dt:
+        return "-"
+    if dt.tzinfo is None:  # databasen lagrer UTC
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(OSLO).strftime(fmt)
+
+
 def _fmt_price(p) -> str:
     return f"{p:,.2f}".replace(",", " ") if isinstance(p, (int, float)) else "-"
 
@@ -64,7 +77,7 @@ def _fmt_price(p) -> str:
 def signal_text(sig: Signal) -> str:
     side = (sig.signal or "").upper()
     icon = "🟢" if side in ("BUY", "LONG") else "🔴" if side in ("SELL", "SHORT") else "ℹ️"
-    t = sig.received_at.strftime("%Y-%m-%d %H:%M:%S UTC") if sig.received_at else "-"
+    t = oslo(sig.received_at)
     lines = [
         f"{icon} <b>{side or '?'}</b> {html.escape(sig.instrument or '?')}",
         f"Indikator: {html.escape(sig.indicator or '-')}",
@@ -85,7 +98,7 @@ def signal_text(sig: Signal) -> str:
         if raw.get("trend_aligned") is False:
             lines.append("⚠️ Mot trend / ingen trend: kun info, ingen trade")
     if sig.status not in ("NEW", "INFO"):
-        d = sig.decided_at.strftime("%H:%M:%S UTC") if sig.decided_at else ""
+        d = oslo(sig.decided_at, "%H:%M:%S") if sig.decided_at else ""
         if sig.status == "APPROVED" and config.AUTO_TRADE:
             lines.append("\n🤖 <b>Auto-handel:</b> sendes til MT5")
         else:
@@ -96,8 +109,8 @@ def signal_text(sig: Signal) -> str:
 
 def mode_text() -> str:
     if config.AUTO_TRADE:
-        return "Modus: 🤖 AUTOMATISK. Trend-signaler handles uten APPROVE, du faar bare varsler"
-    return "Modus: ✋ MANUELL. Hvert signal maa godkjennes med APPROVE"
+        return "Modus: 🤖 AUTOMATISK. Trend-signaler handles uten APPROVE, du får bare varsler"
+    return "Modus: ✋ MANUELL. Hvert signal må godkjennes med APPROVE"
 
 
 def _keyboard(sig_id: int) -> dict:
@@ -154,7 +167,7 @@ async def _handle_message(msg: dict) -> None:
                             "Nye TradingView-signaler kommer hit med APPROVE/REJECT.")
             log.info("Telegram-eier registrert: %s", chat_id)
         elif owner == chat_id:
-            await call("sendMessage", chat_id=chat_id, text="Boten er aktiv. Du er eier.\n/siste - siste signaler\n/status - handel og MT5-konto\n/stopp - noedstopp\n/handel_paa - start handel igjen")
+            await call("sendMessage", chat_id=chat_id, text="Boten er aktiv. Du er eier.\n/siste - siste signaler\n/status - handel og MT5-konto\n/stopp - nødstopp\n/handel_paa - start handel igjen")
         else:
             log.warning("Ukjent chat %s proevde /start", chat_id)
             await call("sendMessage", chat_id=chat_id, text="Ingen tilgang.")
@@ -166,8 +179,8 @@ async def _handle_message(msg: dict) -> None:
     if text.startswith("/stopp"):
         executor.set_paused(True)
         await call("sendMessage", chat_id=chat_id,
-                   text="⛔ Handel PAUSET. Ingen nye ordre sendes. Aapne posisjoner beholder sin SL/TP.\n"
-                        "Skriv /handel_paa for aa starte igjen.")
+                   text="⛔ Handel PAUSET. Ingen nye ordre sendes. Åpne posisjoner beholder sin SL/TP.\n"
+                        "Skriv /handel_paa for å starte igjen.")
         return
 
     if text.startswith("/handel_paa"):
@@ -180,13 +193,13 @@ async def _handle_message(msg: dict) -> None:
         ok, why = executor.state()
         lines = [f"Handel: {why}",
                  mode_text(),
-                 (f"Risiko: {config.RISK_USD:g} $ per trade -> maal {config.RISK_USD * config.RISK_REWARD:g} $ "
+                 (f"Risiko: {config.RISK_USD:g} $ per trade -> mål {config.RISK_USD * config.RISK_REWARD:g} $ "
                   f"(1:{config.RISK_REWARD:g}). Lot regnes ut automatisk"
                   if config.RISK_USD > 0 and executor.ea_mode()
                   else f"Lot: {config.TRADE_LOT} | SL {config.STOP_LOSS_PCT}% | TP {config.TAKE_PROFIT_PCT}%"),
-                 (f"SL: under laveste low / over hoeyeste high siste {config.SL_LOOKBACK_BARS} 5M-lys "
+                 (f"SL: under laveste low / over høyeste high siste {config.SL_LOOKBACK_BARS} 5M-lys "
                   f"+ {config.SL_BUFFER_POINTS:g} punkter" if executor.ea_mode() else ""),
-                 f"Maks aapne posisjoner: {config.MAX_OPEN_POSITIONS} | Symboler: {', '.join(config.ALLOWED_SYMBOLS)}"]
+                 f"Maks åpne posisjoner: {config.MAX_OPEN_POSITIONS} | Symboler: {', '.join(config.ALLOWED_SYMBOLS)}"]
         if executor.ea_mode():
             from app import ea_bridge
             seen = ea_bridge.last_seen_seconds()
@@ -202,7 +215,7 @@ async def _handle_message(msg: dict) -> None:
                 pos = await executor.open_positions()
                 lines.append(f"MT5: {acc.get('login') or acc.get('name', '')} {acc.get('type', '')}")
                 lines.append(f"Balanse {acc.get('balance')} {acc.get('currency', '')} | Equity {acc.get('equity')}")
-                lines.append(f"Aapne posisjoner: {len(pos)}")
+                lines.append(f"Åpne posisjoner: {len(pos)}")
                 for p in pos[:5]:
                     lines.append(f"  {p.get('type', '')[14:]} {p.get('volume')} {p.get('symbol')} "
                                  f"@ {p.get('openPrice')} P/L {p.get('profit')}")
@@ -218,7 +231,7 @@ async def _handle_message(msg: dict) -> None:
             body = "Ingen signaler enda."
         else:
             body = "\n".join(
-                f"#{r.id} {r.received_at:%d.%m %H:%M} {r.instrument} {r.signal} "
+                f"#{r.id} {oslo(r.received_at, '%d.%m %H:%M')} {r.instrument} {r.signal} "
                 f"{_fmt_price(r.price)} [{r.status}]" for r in rows)
         await call("sendMessage", chat_id=chat_id, text=body)
 
