@@ -35,6 +35,9 @@ def _num(name: str, default: float) -> float:
 AUTO_TRADE = os.getenv("AUTO_TRADE", "on").strip().lower() in ("on", "true", "1")
 # Navnet paa aktiv strategi, vises i /status. Endres i Render (STRATEGY).
 STRATEGY = os.getenv("STRATEGY", "").strip() or "5M SMT (NAS100) + 24t trendfilter"
+# TEST: signaler fra 1M-testindikatoren handles selv uten trend (kun for aa teste kjeden).
+# Sett TEST_IGNORE_TREND_1M=off i Render naar testingen er ferdig.
+TEST_IGNORE_TREND_1M = os.getenv("TEST_IGNORE_TREND_1M", "on").strip().lower() in ("on", "true", "1")
 # Noedstopp: ingen ordre sendes uten EXECUTION_ENABLED=on
 EXECUTION_ENABLED = os.getenv("EXECUTION_ENABLED", "off").strip().lower() in ("on", "true", "1")
 # "metaapi" = Render sender ordren via MetaApi.cloud
