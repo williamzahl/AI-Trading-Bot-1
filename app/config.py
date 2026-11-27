@@ -46,6 +46,14 @@ METAAPI_REGION = os.getenv("METAAPI_REGION", "").strip()  # tom = finn automatis
 TRADE_LOT = _num("TRADE_LOT", 0.1)                 # fast lotstoerrelse per ordre
 STOP_LOSS_PCT = _num("STOP_LOSS_PCT", 0.25)        # SL-avstand i % av prisen
 TAKE_PROFIT_PCT = _num("TAKE_PROFIT_PCT", 0.5)     # TP-avstand i % av prisen
+# Risiko per trade i USD. Lot regnes ut av EA-en fra SL-avstanden.
+# 0 = bruk fast TRADE_LOT i stedet.
+RISK_USD = _num("RISK_USD", 250)
+RISK_REWARD = _num("RISK_REWARD", 3)               # TP = 3 x SL-avstand
+SL_LOOKBACK_BARS = int(_num("SL_LOOKBACK_BARS", 6))  # SL under laveste low (5M) siste N lys
+SL_BUFFER_POINTS = _num("SL_BUFFER_POINTS", 2)     # ekstra avstand under low / over high (i pris)
+MAX_LOT = _num("MAX_LOT", 20)                      # sikkerhetstak paa lot
+MAX_SL_PCT = _num("MAX_SL_PCT", 1.0)               # hopp over trade hvis SL er lenger unna enn dette (%)
 MAX_OPEN_POSITIONS = int(_num("MAX_OPEN_POSITIONS", 1))
 MAX_SIGNAL_AGE_MIN = _num("MAX_SIGNAL_AGE_MIN", 15)
 ALLOWED_SYMBOLS = [x.strip().upper() for x in os.getenv("ALLOWED_SYMBOLS", "NAS100,US500").split(",") if x.strip()]

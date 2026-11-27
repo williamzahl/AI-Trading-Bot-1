@@ -180,7 +180,12 @@ async def _handle_message(msg: dict) -> None:
         ok, why = executor.state()
         lines = [f"Handel: {why}",
                  mode_text(),
-                 f"Lot: {config.TRADE_LOT} | SL {config.STOP_LOSS_PCT}% | TP {config.TAKE_PROFIT_PCT}%",
+                 (f"Risiko: {config.RISK_USD:g} $ per trade -> maal {config.RISK_USD * config.RISK_REWARD:g} $ "
+                  f"(1:{config.RISK_REWARD:g}). Lot regnes ut automatisk"
+                  if config.RISK_USD > 0 and executor.ea_mode()
+                  else f"Lot: {config.TRADE_LOT} | SL {config.STOP_LOSS_PCT}% | TP {config.TAKE_PROFIT_PCT}%"),
+                 (f"SL: under laveste low / over hoeyeste high siste {config.SL_LOOKBACK_BARS} 5M-lys "
+                  f"+ {config.SL_BUFFER_POINTS:g} punkter" if executor.ea_mode() else ""),
                  f"Maks aapne posisjoner: {config.MAX_OPEN_POSITIONS} | Symboler: {', '.join(config.ALLOWED_SYMBOLS)}"]
         if executor.ea_mode():
             from app import ea_bridge
@@ -203,7 +208,7 @@ async def _handle_message(msg: dict) -> None:
                                  f"@ {p.get('openPrice')} P/L {p.get('profit')}")
             except Exception as e:
                 lines.append(f"⚠️ Fikk ikke kontakt med MetaApi: {e}"[:300])
-        await call("sendMessage", chat_id=chat_id, text="\n".join(lines))
+        await call("sendMessage", chat_id=chat_id, text="\n".join(l for l in lines if l))
         return
 
     if text.startswith("/siste"):
