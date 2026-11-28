@@ -115,6 +115,11 @@ string trendMode = input.string("Hide counter-trend", "Trend filter for SMT line
      tooltip="Hide counter-trend = a bullish SMT in a DOWN trend or a bearish SMT in an UP trend is neither drawn nor alerted. Grey = drawn in grey (alert follows the INFO setting below). SMTs with no trend (NONE) are drawn in grey. Off = everything drawn in normal colors.")
 int trendLookbackBars = input.int(12, "With-trend pullback: swing must be extreme of last N 5M bars", minval=0, maxval=300, group=GROUP_BIAS,
      tooltip="In an UP trend a swing low (and in a DOWN trend a swing high) is a pullback, so it only has to be the lowest low / highest high of the last N 5M bars (12 = 1 hour) instead of the stricter major-swing setting, and the mid-range filter is skipped. Gives more SMTs in the trend's direction.")
+string trendSource = input.string("Intraday EMA", "Trend source",
+     options=["Intraday EMA", "24h change", "24h change, else intraday"], group=GROUP_BIAS,
+     tooltip="Intraday EMA = NAS100 fast EMA above slow EMA on the source candles is UP, below is DOWN (follows the trend you see on the chart today). 24h change = the old rule (NAS100 change over ~24h vs the threshold above). This trend decides which SMTs are shown, which are sent as trend-aligned (traded by Render), and which swings count as with-trend pullbacks.")
+int trendFastLen = input.int(50, "Intraday trend: fast EMA (source candles)", minval=2, maxval=500, group=GROUP_BIAS)
+int trendSlowLen = input.int(200, "Intraday trend: slow EMA (source candles)", minval=3, maxval=1000, group=GROUP_BIAS)
 color greyColor = input.color(color.gray, "Counter-trend / no-trend color", group=GROUP_BIAS)
 bool sendCounterTrend = input.bool(true, "Also alert counter-trend SMT (sent as INFO)", group=GROUP_BIAS,
      tooltip="Off = bearish SMT in an UP trend and bullish SMT in a DOWN trend (and all SMT with no trend) are not alerted at all.")
@@ -169,6 +174,8 @@ type SourceBundle
     float prevMagnetAbove2 = na
     float prevMagnetBelow1 = na
     float prevMagnetBelow2 = na
+    int trendDir = 0
+    int prevTrendDir = 0
 type PendingSmt
     string eventId
     bool bullish
@@ -179,6 +186,7 @@ type PendingSmt
     bool alertSent
     string sweeper = ""
     float smtLevel = na  // SMT extreme on the chart symbol: lowest of swing low and sweep low (bullish), highest of swing high and sweep high (bearish)
+    string trend = "NONE"  // trend state at the SMT candle (UP / DOWN / NONE)
 type SourceCandle
     int sourceTime
     int sourceClose
@@ -237,8 +245,13 @@ f_sourceBundle(int drawingStrength, int alertStrength, bool includeHighPivots, b
     float trendPct = not na(trendRefClose) and trendRefClose != 0 ? 100.0 * (close - trendRefClose) / trendRefClose : na
     bool trendUp = not na(trendPct) and trendPct >= biasThresholdPct
     bool trendDown = not na(trendPct) and trendPct <= -biasThresholdPct
-    bool lowWithTrend = trendUp and trendMode != "Off"
-    bool highWithTrend = trendDown and trendMode != "Off"
+    float emaFast = ta.ema(close, trendFastLen)
+    float emaSlow = ta.ema(close, trendSlowLen)
+    int intradayDir = na(emaFast) or na(emaSlow) ? 0 : emaFast > emaSlow ? 1 : emaFast < emaSlow ? -1 : 0
+    int dayDir = trendUp ? 1 : trendDown ? -1 : 0
+    int trendDirNow = trendSource == "Intraday EMA" ? intradayDir : trendSource == "24h change" ? dayDir : (dayDir != 0 ? dayDir : intradayDir)
+    bool lowWithTrend = trendDirNow == 1 and trendMode != "Off"
+    bool highWithTrend = trendDirNow == -1 and trendMode != "Off"
     float majorLow = ta.lowest(low, drawingStrength + majorLookbackBars + 1)
     float majorHigh = ta.highest(high, drawingStrength + majorLookbackBars + 1)
     float pullbackLow = ta.lowest(low, drawingStrength + trendLookbackBars + 1)
@@ -344,7 +357,7 @@ f_sourceBundle(int drawingStrength, int alertStrength, bool includeHighPivots, b
          swingHigh, swingHighTime, swingLow, swingLowTime, alertSwingHigh, alertSwingHighTime, alertSwingLow, alertSwingLowTime, atrValue,
          bundleHigh[1], bundleLow[1], close[1], time[1], time_close[1],
          swingHigh[1], swingHighTime[1], swingLow[1], swingLowTime[1], atrValue[1],
-         a11, a12, b11, b12, a11[1], a12[1], b11[1], b12[1])
+         a11, a12, b11, b12, a11[1], a12[1], b11[1], b12[1], trendDirNow, nz(trendDirNow[1]))
 // calc_bars_count is a compile-time constant in Pine. These small wrappers let
 // the user-selected signal cap choose a matching, bounded 5M history window.
 f_request900(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
@@ -480,7 +493,8 @@ f_previousBundle(SourceBundle source) =>
                  tickSize=source.tickSize, pivotHigh=source.prevPivotHigh, pivotHighTime=source.prevPivotHighTime,
                  pivotLow=source.prevPivotLow, pivotLowTime=source.prevPivotLowTime, atrValue=source.prevAtrValue,
                  magnetAbove1=source.prevMagnetAbove1, magnetAbove2=source.prevMagnetAbove2,
-                 magnetBelow1=source.prevMagnetBelow1, magnetBelow2=source.prevMagnetBelow2)
+                 magnetBelow1=source.prevMagnetBelow1, magnetBelow2=source.prevMagnetBelow2,
+                 trendDir=source.prevTrendDir)
     previous
 // Most extreme high (highSide) or low after afterTime, earliest candle on ties.
 f_extremeAfter(array<SourceCandle> candles, int afterTime, bool highSide) =>
@@ -706,7 +720,7 @@ f_alertJson(PendingSmt pending, bool trendAligned) =>
          q + "timeframe" + q + ":" + q + "5" + q + "," +
          q + "time" + q + ":" + q + str.format_time(pending.confirmationBarTime, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC") + q + "," +
          q + "sweeper" + q + ":" + q + pending.sweeper + q + "," +
-         q + "bias" + q + ":" + q + bias24State + q + "," +
+         q + "bias" + q + ":" + q + pending.trend + q + "," +
          q + "change_24h_pct" + q + ":" + pctText + "," +
          q + "trend_aligned" + q + ":" + (trendAligned ? "true" : "false") + "," +
          q + "smt_level" + q + ":" + (na(pending.smtLevel) ? "null" : str.tostring(pending.smtLevel, format.mintick)) + "," +
@@ -726,7 +740,7 @@ f_processPendingAlerts(array<PendingSmt> queue, array<string> sentKeys,
             pending.completedCandlesSinceConfirmation := pending.completedCandlesSinceConfirmation + 1
         bool directionEnabled = pending.bullish ? bullishEnabled : bearishEnabled
         if pending.sourceTimeframe == "5" and pending.completedCandlesSinceConfirmation >= requiredCandles
-            bool trendAligned = pending.bullish ? bias24State == "UP" : bias24State == "DOWN"
+            bool trendAligned = pending.bullish ? pending.trend == "UP" : pending.trend == "DOWN"
             bool inBreakWindow = f_inBlockWindow(pending.confirmationBarTime)
             if not pending.alertSent and alertsEnabled and directionEnabled and (trendAligned or sendCounterTrend) and not inBreakWindow
                 string message = f_alertJson(pending, trendAligned)
@@ -907,6 +921,7 @@ if canRunEngine
             float nasLowPivot = nasSource.pivotLow
             int nasLowPivotTime = nasSource.pivotLowTime
             float nasATR = nasSource.atrValue
+            string nasTrendState = nasSource.trendDir == 1 ? "UP" : nasSource.trendDir == -1 ? "DOWN" : "NONE"
             float spxHigh = spxSource.highValue
             float spxLow = spxSource.lowValue
             float spxClosePrice = spxSource.closeValue
@@ -1119,8 +1134,8 @@ if canRunEngine
                             bearishSignalCount += 1
                             debugSignalStatus := "BEARISH SMT confirmed: " + (bearNASSwept ? "NAS swept high; SPX held" : "SPX swept high; NAS held")
                             // Trend filter: the drawing and the alert follow the same decision.
-                            bool bearCounter = trendMode != "Off" and bias24State == "UP"
-                            bool bearMuted = trendMode != "Off" and bias24State != "DOWN"
+                            bool bearCounter = trendMode != "Off" and nasTrendState == "UP"
+                            bool bearMuted = trendMode != "Off" and nasTrendState != "DOWN"
                             bool bearHidden = trendMode == "Hide counter-trend" and bearCounter
                             if bearHidden
                                 debugSignalStatus := debugSignalStatus + " (hidden: counter-trend)"
@@ -1129,7 +1144,7 @@ if canRunEngine
                                 array.push(alertProcessedKeys, eventKey)
                                 while array.size(alertProcessedKeys) > 512
                                     array.shift(alertProcessedKeys)
-                                array.push(pendingAlerts, PendingSmt.new(eventKey, false, "5", nasClose, chartConfirmationClose, 0, false, bearNASSwept ? nasTicker : spxTicker, drawUsingNASPrices ? math.max(bearRefNASPrice, bearEndNASPrice) : math.max(bearRefSPXPrice, bearEndSPXPrice)))
+                                array.push(pendingAlerts, PendingSmt.new(eventKey, false, "5", nasClose, chartConfirmationClose, 0, false, bearNASSwept ? nasTicker : spxTicker, drawUsingNASPrices ? math.max(bearRefNASPrice, bearEndNASPrice) : math.max(bearRefSPXPrice, bearEndSPXPrice), nasTrendState))
                             int lineStartTime = drawUsingNASPrices ? bearRefNASTime : bearRefSPXTime
                             float lineStartPrice = drawUsingNASPrices ? bearRefNASPrice : bearRefSPXPrice
                             float lineEndPrice = drawUsingNASPrices ? bearEndNASPrice : bearEndSPXPrice
@@ -1169,8 +1184,8 @@ if canRunEngine
                             bullishSignalCount += 1
                             debugSignalStatus := "BULLISH SMT confirmed: " + (bullNASSwept ? "NAS swept low; SPX held" : "SPX swept low; NAS held")
                             // Trend filter: the drawing and the alert follow the same decision.
-                            bool bullCounter = trendMode != "Off" and bias24State == "DOWN"
-                            bool bullMuted = trendMode != "Off" and bias24State != "UP"
+                            bool bullCounter = trendMode != "Off" and nasTrendState == "DOWN"
+                            bool bullMuted = trendMode != "Off" and nasTrendState != "UP"
                             bool bullHidden = trendMode == "Hide counter-trend" and bullCounter
                             if bullHidden
                                 debugSignalStatus := debugSignalStatus + " (hidden: counter-trend)"
@@ -1179,7 +1194,7 @@ if canRunEngine
                                 array.push(alertProcessedKeys, eventKey)
                                 while array.size(alertProcessedKeys) > 512
                                     array.shift(alertProcessedKeys)
-                                array.push(pendingAlerts, PendingSmt.new(eventKey, true, "5", nasClose, chartConfirmationClose, 0, false, bullNASSwept ? nasTicker : spxTicker, drawUsingNASPrices ? math.min(bullRefNASPrice, bullEndNASPrice) : math.min(bullRefSPXPrice, bullEndSPXPrice)))
+                                array.push(pendingAlerts, PendingSmt.new(eventKey, true, "5", nasClose, chartConfirmationClose, 0, false, bullNASSwept ? nasTicker : spxTicker, drawUsingNASPrices ? math.min(bullRefNASPrice, bullEndNASPrice) : math.min(bullRefSPXPrice, bullEndSPXPrice), nasTrendState))
                             int lineStartTime = drawUsingNASPrices ? bullRefNASTime : bullRefSPXTime
                             float lineStartPrice = drawUsingNASPrices ? bullRefNASPrice : bullRefSPXPrice
                             float lineEndPrice = drawUsingNASPrices ? bullEndNASPrice : bullEndSPXPrice
