@@ -32,8 +32,10 @@ int maxSwingDistanceBars = input.int(100, "Maximum distance from matched swing (
 int pivotQueueCapacity = math.min(32, swingToleranceBars + drawingPivotStrength + 2)
 int alertPivotQueueCapacity = math.min(32, swingToleranceBars + alertPivotStrength + 2)
 float minimumStrength = input.float(35.0, "Minimum SMT strength (%)", minval=0.0, maxval=100.0, step=1.0, group=GROUP_DETECTION)
-int minimumDivergenceTicks = input.int(10, "Minimum divergence distance (sweeper ticks)", minval=0, maxval=10000, group=GROUP_DETECTION,
-     tooltip="Measured in the symbol's own tick size (syminfo.mintick). Pepperstone index CFDs tick in 0.1 points, so 10 ticks = 1 point.")
+int minimumDivergenceTicks = input.int(2, "Minimum divergence distance (sweeper ticks)", minval=0, maxval=10000, group=GROUP_DETECTION,
+     tooltip="Measured in the sweeping symbol's own tick size. Only a noise floor: the real size check is the ATR setting below, which is fair to both NAS100 and US500 (1 point on US500 is a much bigger move than 1 point on NAS100).")
+float minSweepATR = input.float(0.05, "Minimum sweep beyond the level (x ATR of the sweeping market)", minval=0.0, maxval=5.0, step=0.01, group=GROUP_DETECTION,
+     tooltip="How far the sweeping market must trade beyond its old high/low, in its own 5M ATR. 0.05 = about 1.5 points on NAS100 or 0.25 points on US500.")
 bool useMinimumPercentDifference = input.bool(false, "Use minimum percentage difference", group=GROUP_DETECTION)
 float minimumPercentDifference = input.float(0.10, "Minimum percentage difference (%)", minval=0.0, maxval=10.0, step=0.01, group=GROUP_DETECTION)
 string GROUP_LEVELS = "Key levels (only logical SMTs)"
@@ -651,7 +653,8 @@ f_evaluateSweeps(array<SweepReference> refs, array<SourceCandle> nasCandles, arr
                 float sweepTick = nasSweeper ? nasTick : spxTick
                 float strengthPct = endpointsKnown and not na(sweepATR) and sweepATR > 0 and not na(heldATR) and heldATR > 0 ?
                      math.min(100.0, 50.0 * (sweepDistance / sweepATR + heldDistance / heldATR)) : na
-                bool tickPass = endpointsKnown and not na(sweepTick) and sweepTick > 0 and sweepDistance / sweepTick >= minimumDivergenceTicks
+                bool tickPass = endpointsKnown and not na(sweepTick) and sweepTick > 0 and sweepDistance / sweepTick >= minimumDivergenceTicks and
+                     (minSweepATR <= 0 or (not na(sweepATR) and sweepATR > 0 and sweepDistance >= minSweepATR * sweepATR))
                 bool percentPass = endpointsKnown
                 if endpointsKnown and useMinimumPercentDifference
                     float nasMovePct = highSide ? 100.0 * (nasEnd - activeRef.nasPrice) / activeRef.nasPrice : 100.0 * (activeRef.nasPrice - nasEnd) / activeRef.nasPrice
@@ -697,7 +700,7 @@ f_evaluateSweeps(array<SweepReference> refs, array<SourceCandle> nasCandles, arr
                 else if not found
                     reason := not endpointsKnown ? "source candle history incomplete" :
                          not segmentClear ? "segment crosses an intermediate 5M candle on NAS or SPX" :
-                         not tickPass ? "divergence ticks below minimum" :
+                         not tickPass ? "sweep too small (ticks / ATR minimum)" :
                          not percentPass ? "percent filter" : not strengthPass ? "strength below minimum" :
                          not swingPass ? "not a major swing (too small move away)" : "untaken key level just beyond the SMT"
         if removeRef
