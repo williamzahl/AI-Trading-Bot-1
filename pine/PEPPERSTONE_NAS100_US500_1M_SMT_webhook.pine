@@ -1004,17 +1004,17 @@ if canRunEngine
                     SourceBundle dbgOther = drawUsingNASPrices ? spxSource : nasSource
                     string otherName = drawUsingNASPrices ? spxTicker : nasTicker
                     if dbgChart.highRejectCode > 0
-                        label.new(dbgChart.highRejectTime, dbgChart.highRejectPrice, "H x " + (dbgChart.highRejectCode == 1 ? "not swing extreme" : dbgChart.highRejectCode == 3 ? "pullback too small" : "mid-range" + " | trend " + (dbgChart.trendDir == 1 ? "UP" : dbgChart.trendDir == -1 ? "DOWN" : "NONE")),
+                        label.new(dbgChart.highRejectTime, dbgChart.highRejectPrice, "H x " + (dbgChart.highRejectCode == 1 ? "not swing extreme" : dbgChart.highRejectCode == 3 ? "pullback too small" : "mid-range") + " | trend " + (dbgChart.trendDir == 1 ? "UP" : dbgChart.trendDir == -1 ? "DOWN" : "NONE"),
                              xloc=xloc.bar_time, style=label.style_label_down, size=size.tiny, color=color.new(color.gray, 20), textcolor=color.white)
                     if dbgChart.lowRejectCode > 0
-                        label.new(dbgChart.lowRejectTime, dbgChart.lowRejectPrice, "L x " + (dbgChart.lowRejectCode == 1 ? "not swing extreme" : dbgChart.lowRejectCode == 3 ? "pullback too small" : "mid-range" + " | trend " + (dbgChart.trendDir == 1 ? "UP" : dbgChart.trendDir == -1 ? "DOWN" : "NONE")),
+                        label.new(dbgChart.lowRejectTime, dbgChart.lowRejectPrice, "L x " + (dbgChart.lowRejectCode == 1 ? "not swing extreme" : dbgChart.lowRejectCode == 3 ? "pullback too small" : "mid-range") + " | trend " + (dbgChart.trendDir == 1 ? "UP" : dbgChart.trendDir == -1 ? "DOWN" : "NONE"),
                              xloc=xloc.bar_time, style=label.style_label_up, size=size.tiny, color=color.new(color.gray, 20), textcolor=color.white)
                     // The other market's swing is filtered too: show it on this chart's candle.
                     if dbgOther.highRejectCode > 0
-                        label.new(dbgOther.highRejectTime, drawUsingNASPrices ? nasHigh : spxHigh, otherName + " H x " + (dbgOther.highRejectCode == 1 ? "not swing extreme" : dbgOther.highRejectCode == 3 ? "pullback too small" : "mid-range" + " | trend " + (dbgOther.trendDir == 1 ? "UP" : dbgOther.trendDir == -1 ? "DOWN" : "NONE")),
+                        label.new(dbgOther.highRejectTime, drawUsingNASPrices ? nasHigh : spxHigh, otherName + " H x " + (dbgOther.highRejectCode == 1 ? "not swing extreme" : dbgOther.highRejectCode == 3 ? "pullback too small" : "mid-range") + " | trend " + (dbgOther.trendDir == 1 ? "UP" : dbgOther.trendDir == -1 ? "DOWN" : "NONE"),
                              xloc=xloc.bar_time, yloc=yloc.abovebar, style=label.style_label_down, size=size.tiny, color=color.new(color.purple, 30), textcolor=color.white)
                     if dbgOther.lowRejectCode > 0
-                        label.new(dbgOther.lowRejectTime, drawUsingNASPrices ? nasLow : spxLow, otherName + " L x " + (dbgOther.lowRejectCode == 1 ? "not swing extreme" : dbgOther.lowRejectCode == 3 ? "pullback too small" : "mid-range" + " | trend " + (dbgOther.trendDir == 1 ? "UP" : dbgOther.trendDir == -1 ? "DOWN" : "NONE")),
+                        label.new(dbgOther.lowRejectTime, drawUsingNASPrices ? nasLow : spxLow, otherName + " L x " + (dbgOther.lowRejectCode == 1 ? "not swing extreme" : dbgOther.lowRejectCode == 3 ? "pullback too small" : "mid-range") + " | trend " + (dbgOther.trendDir == 1 ? "UP" : dbgOther.trendDir == -1 ? "DOWN" : "NONE"),
                              xloc=xloc.bar_time, yloc=yloc.belowbar, style=label.style_label_up, size=size.tiny, color=color.new(color.purple, 30), textcolor=color.white)
                 // Independent alert-pivot engine. Pivot alerts are evaluated on
                 // this aligned, closed 5M NAS/SPX source pair only.
