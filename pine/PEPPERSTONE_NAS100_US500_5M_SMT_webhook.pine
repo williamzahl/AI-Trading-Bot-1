@@ -114,8 +114,9 @@ int biasLookbackBars = input.int(23, "Bias lookback (hourly bars)", minval=1, ma
 string trendMode = input.string("Hide counter-trend", "Trend filter for SMT lines and alerts",
      options=["Hide counter-trend", "Grey counter-trend", "Off"], group=GROUP_BIAS,
      tooltip="Hide counter-trend = a bullish SMT in a DOWN trend or a bearish SMT in an UP trend is neither drawn nor alerted. Grey = drawn in grey (alert follows the INFO setting below). SMTs with no trend (NONE) are drawn in grey. Off = everything drawn in normal colors.")
-int trendLookbackBars = input.int(12, "With-trend pullback: swing must be extreme of last N 5M bars", minval=0, maxval=300, group=GROUP_BIAS,
-     tooltip="In an UP trend a swing low (and in a DOWN trend a swing high) is a pullback, so it only has to be the lowest low / highest high of the last N 5M bars (12 = 1 hour) instead of the stricter major-swing setting, and the mid-range filter is skipped. Gives more SMTs in the trend's direction.")
+int trendLookbackBars = input.int(12, "With-trend swing: pullback window (bars before the swing)", minval=1, maxval=300, group=GROUP_BIAS,
+     tooltip="In a DOWN trend a swing high is a lower high, so it is NOT required to be the highest high. Instead price must have rallied into it by at least the ATR amount below, measured from the lowest low of this many bars before the swing (12 = 1 hour on 5M). Same for swing lows in an UP trend. The mid-range filter is skipped for these swings.")
+float trendPullbackATR = input.float(1.0, "With-trend swing: minimum pullback into the swing (x ATR)", minval=0.0, maxval=10.0, step=0.1, group=GROUP_BIAS)
 string trendSource = input.string("Intraday EMA", "Trend source",
      options=["Intraday EMA", "24h change", "24h change, else intraday"], group=GROUP_BIAS,
      tooltip="Intraday EMA = NAS100 fast EMA above slow EMA on the source candles is UP, below is DOWN (follows the trend you see on the chart today). 24h change = the old rule (NAS100 change over ~24h vs the threshold above). This trend decides which SMTs are shown, which are sent as trend-aligned (traded by Render), and which swings count as with-trend pullbacks.")
@@ -262,20 +263,32 @@ f_sourceBundle(int drawingStrength, int alertStrength, bool includeHighPivots, b
     bool highWithTrend = trendDirNow == -1 and trendMode != "Off"
     float majorLow = ta.lowest(low, drawingStrength + majorLookbackBars + 1)
     float majorHigh = ta.highest(high, drawingStrength + majorLookbackBars + 1)
-    float pullbackLow = ta.lowest(low, drawingStrength + trendLookbackBars + 1)
-    float pullbackHigh = ta.highest(high, drawingStrength + trendLookbackBars + 1)
-    int lowLookback = lowWithTrend ? trendLookbackBars : majorLookbackBars
-    int highLookback = highWithTrend ? trendLookbackBars : majorLookbackBars
+    // Extremes of the window just before the swing candle, for the with-trend pullback test.
+    float preSwingLow = ta.lowest(low, trendLookbackBars)[drawingStrength + 1]
+    float preSwingHigh = ta.highest(high, trendLookbackBars)[drawingStrength + 1]
+    float pivotATR = ta.atr(14)
     float rawSwingHigh = swingHigh
     float rawSwingLow = swingLow
     int highRejectCode = 0
     int lowRejectCode = 0
-    if lowLookback > 0 and not na(swingLow) and swingLow > (lowWithTrend ? pullbackLow : majorLow)
-        swingLow := na
-        lowRejectCode := 1
-    if highLookback > 0 and not na(swingHigh) and swingHigh < (highWithTrend ? pullbackHigh : majorHigh)
-        swingHigh := na
-        highRejectCode := 1
+    if not na(swingLow)
+        if lowWithTrend
+            // Higher low in an UP trend: price must have dropped into it.
+            if trendPullbackATR > 0 and (na(preSwingHigh) or na(pivotATR) or preSwingHigh - swingLow < trendPullbackATR * pivotATR)
+                swingLow := na
+                lowRejectCode := 3
+        else if majorLookbackBars > 0 and swingLow > majorLow
+            swingLow := na
+            lowRejectCode := 1
+    if not na(swingHigh)
+        if highWithTrend
+            // Lower high in a DOWN trend: price must have rallied into it.
+            if trendPullbackATR > 0 and (na(preSwingLow) or na(pivotATR) or swingHigh - preSwingLow < trendPullbackATR * pivotATR)
+                swingHigh := na
+                highRejectCode := 3
+        else if majorLookbackBars > 0 and swingHigh < majorHigh
+            swingHigh := na
+            highRejectCode := 1
     // Not mid-range: the swing must sit near the top (high) or bottom (low)
     // of the last rangeBars candles.
     float rangeTop = ta.highest(high, math.max(1, rangeBars))
@@ -989,17 +1002,17 @@ if canRunEngine
                     SourceBundle dbgOther = drawUsingNASPrices ? spxSource : nasSource
                     string otherName = drawUsingNASPrices ? spxTicker : nasTicker
                     if dbgChart.highRejectCode > 0
-                        label.new(dbgChart.highRejectTime, dbgChart.highRejectPrice, "H x " + (dbgChart.highRejectCode == 1 ? "not swing extreme" : "mid-range"),
+                        label.new(dbgChart.highRejectTime, dbgChart.highRejectPrice, "H x " + (dbgChart.highRejectCode == 1 ? "not swing extreme" : dbgChart.highRejectCode == 3 ? "pullback too small" : "mid-range" + " | trend " + (dbgChart.trendDir == 1 ? "UP" : dbgChart.trendDir == -1 ? "DOWN" : "NONE")),
                              xloc=xloc.bar_time, style=label.style_label_down, size=size.tiny, color=color.new(color.gray, 20), textcolor=color.white)
                     if dbgChart.lowRejectCode > 0
-                        label.new(dbgChart.lowRejectTime, dbgChart.lowRejectPrice, "L x " + (dbgChart.lowRejectCode == 1 ? "not swing extreme" : "mid-range"),
+                        label.new(dbgChart.lowRejectTime, dbgChart.lowRejectPrice, "L x " + (dbgChart.lowRejectCode == 1 ? "not swing extreme" : dbgChart.lowRejectCode == 3 ? "pullback too small" : "mid-range" + " | trend " + (dbgChart.trendDir == 1 ? "UP" : dbgChart.trendDir == -1 ? "DOWN" : "NONE")),
                              xloc=xloc.bar_time, style=label.style_label_up, size=size.tiny, color=color.new(color.gray, 20), textcolor=color.white)
                     // The other market's swing is filtered too: show it on this chart's candle.
                     if dbgOther.highRejectCode > 0
-                        label.new(dbgOther.highRejectTime, drawUsingNASPrices ? nasHigh : spxHigh, otherName + " H x " + (dbgOther.highRejectCode == 1 ? "not swing extreme" : "mid-range"),
+                        label.new(dbgOther.highRejectTime, drawUsingNASPrices ? nasHigh : spxHigh, otherName + " H x " + (dbgOther.highRejectCode == 1 ? "not swing extreme" : dbgOther.highRejectCode == 3 ? "pullback too small" : "mid-range" + " | trend " + (dbgOther.trendDir == 1 ? "UP" : dbgOther.trendDir == -1 ? "DOWN" : "NONE")),
                              xloc=xloc.bar_time, yloc=yloc.abovebar, style=label.style_label_down, size=size.tiny, color=color.new(color.purple, 30), textcolor=color.white)
                     if dbgOther.lowRejectCode > 0
-                        label.new(dbgOther.lowRejectTime, drawUsingNASPrices ? nasLow : spxLow, otherName + " L x " + (dbgOther.lowRejectCode == 1 ? "not swing extreme" : "mid-range"),
+                        label.new(dbgOther.lowRejectTime, drawUsingNASPrices ? nasLow : spxLow, otherName + " L x " + (dbgOther.lowRejectCode == 1 ? "not swing extreme" : dbgOther.lowRejectCode == 3 ? "pullback too small" : "mid-range" + " | trend " + (dbgOther.trendDir == 1 ? "UP" : dbgOther.trendDir == -1 ? "DOWN" : "NONE")),
                              xloc=xloc.bar_time, yloc=yloc.belowbar, style=label.style_label_up, size=size.tiny, color=color.new(color.purple, 30), textcolor=color.white)
                 // Independent alert-pivot engine. Pivot alerts are evaluated on
                 // this aligned, closed 5M NAS/SPX source pair only.
