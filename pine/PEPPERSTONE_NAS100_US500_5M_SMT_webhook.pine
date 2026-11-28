@@ -1,5 +1,5 @@
 //@version=6
-indicator("Pepperstone NAS100 / US500 5M SMT", overlay=true, max_lines_count=500, dynamic_requests=true, max_bars_back=500)
+indicator("Pepperstone NAS100 / US500 5M SMT", overlay=true, max_lines_count=500, max_labels_count=500, dynamic_requests=true, max_bars_back=500)
 // CFD version of the MNQ/MES 5M SMT indicator, built for Pepperstone's feed so
 // the TradingView signal matches the prices in the Pepperstone MT5 account.
 // Use it on a PEPPERSTONE:NAS100 or PEPPERSTONE:US500 chart (5M or lower for drawings).
@@ -72,7 +72,8 @@ string webhookSecret = input.string("", "Webhook secret", group=GROUP_WEBHOOK,
      tooltip="Leave empty (recommended) and put the key in the webhook URL as ?key=... instead. If filled in, it must match WEBHOOK_SECRET on Render.")
 string indicatorId = input.string("SMT_PEPPERSTONE_5M", "Indicator id", group=GROUP_WEBHOOK)
 string GROUP_DEBUG = "Debug"
-bool debugMode = input.bool(false, "Enable debug mode", group=GROUP_DEBUG)
+bool debugMode = input.bool(false, "Enable debug mode", group=GROUP_DEBUG,
+     tooltip="Shows a table with the latest status, and small labels on the chart: 'ref' = swing accepted as SMT level, 'H x'/'L x' = swing thrown away (with reason), and a label with the reason when a sweep happened but the SMT was rejected.")
 int chartSeconds = timeframe.in_seconds()
 string chartTicker = str.upper(syminfo.ticker)
 // Ticker part of an input such as "PEPPERSTONE:NAS100.P" -> "NAS100.P".
@@ -176,6 +177,13 @@ type SourceBundle
     float prevMagnetBelow2 = na
     int trendDir = 0
     int prevTrendDir = 0
+    // Debug: swing that existed but was thrown away by a filter (1 = lookback, 2 = mid-range).
+    int highRejectCode = 0
+    int highRejectTime = na
+    float highRejectPrice = na
+    int lowRejectCode = 0
+    int lowRejectTime = na
+    float lowRejectPrice = na
 type PendingSmt
     string eventId
     bool bullish
@@ -258,10 +266,16 @@ f_sourceBundle(int drawingStrength, int alertStrength, bool includeHighPivots, b
     float pullbackHigh = ta.highest(high, drawingStrength + trendLookbackBars + 1)
     int lowLookback = lowWithTrend ? trendLookbackBars : majorLookbackBars
     int highLookback = highWithTrend ? trendLookbackBars : majorLookbackBars
+    float rawSwingHigh = swingHigh
+    float rawSwingLow = swingLow
+    int highRejectCode = 0
+    int lowRejectCode = 0
     if lowLookback > 0 and not na(swingLow) and swingLow > (lowWithTrend ? pullbackLow : majorLow)
         swingLow := na
+        lowRejectCode := 1
     if highLookback > 0 and not na(swingHigh) and swingHigh < (highWithTrend ? pullbackHigh : majorHigh)
         swingHigh := na
+        highRejectCode := 1
     // Not mid-range: the swing must sit near the top (high) or bottom (low)
     // of the last rangeBars candles.
     float rangeTop = ta.highest(high, math.max(1, rangeBars))
@@ -270,8 +284,10 @@ f_sourceBundle(int drawingStrength, int alertStrength, bool includeHighPivots, b
     if rangeBars > 0 and rangeEdgePct < 100 and not na(rangeSize) and rangeSize > 0
         if not highWithTrend and not na(swingHigh) and (swingHigh - rangeBottom) / rangeSize < 1.0 - rangeEdgePct / 100.0
             swingHigh := na
+            highRejectCode := 2
         if not lowWithTrend and not na(swingLow) and (rangeTop - swingLow) / rangeSize < 1.0 - rangeEdgePct / 100.0
             swingLow := na
+            lowRejectCode := 2
     // Key levels on the New York clock. Trading day starts with Asia (18:00 NY).
     int nyMinute = hour(time, "America/New_York") * 60 + minute(time, "America/New_York")
     int sessionNow = nyMinute >= 18 * 60 or nyMinute < 2 * 60 ? 0 : nyMinute < 8 * 60 + 30 ? 1 : 2
@@ -357,7 +373,9 @@ f_sourceBundle(int drawingStrength, int alertStrength, bool includeHighPivots, b
          swingHigh, swingHighTime, swingLow, swingLowTime, alertSwingHigh, alertSwingHighTime, alertSwingLow, alertSwingLowTime, atrValue,
          bundleHigh[1], bundleLow[1], close[1], time[1], time_close[1],
          swingHigh[1], swingHighTime[1], swingLow[1], swingLowTime[1], atrValue[1],
-         a11, a12, b11, b12, a11[1], a12[1], b11[1], b12[1], trendDirNow, nz(trendDirNow[1]))
+         a11, a12, b11, b12, a11[1], a12[1], b11[1], b12[1], trendDirNow, nz(trendDirNow[1]),
+         highRejectCode, highRejectCode > 0 ? time[drawingStrength] : na, highRejectCode > 0 ? rawSwingHigh : na,
+         lowRejectCode, lowRejectCode > 0 ? time[drawingStrength] : na, lowRejectCode > 0 ? rawSwingLow : na)
 // calc_bars_count is a compile-time constant in Pine. These small wrappers let
 // the user-selected signal cap choose a matching, bounded 5M history window.
 f_request900(string tickerId, int drawingStrength, int alertStrength, bool includeHighPivots, bool includeLowPivots) =>
@@ -966,6 +984,23 @@ if canRunEngine
                      SourceCandle.new(nasTime, nasClose, nasHigh, nasLow), alertSourceCandleCapacity)
                 f_pushSourceCandle(alertSPXSourceCandles,
                      SourceCandle.new(spxTime, spxClose, spxHigh, spxLow), alertSourceCandleCapacity)
+                if debugMode and drawingsVisible
+                    SourceBundle dbgChart = drawUsingNASPrices ? nasSource : spxSource
+                    SourceBundle dbgOther = drawUsingNASPrices ? spxSource : nasSource
+                    string otherName = drawUsingNASPrices ? spxTicker : nasTicker
+                    if dbgChart.highRejectCode > 0
+                        label.new(dbgChart.highRejectTime, dbgChart.highRejectPrice, "H x " + (dbgChart.highRejectCode == 1 ? "not swing extreme" : "mid-range"),
+                             xloc=xloc.bar_time, style=label.style_label_down, size=size.tiny, color=color.new(color.gray, 20), textcolor=color.white)
+                    if dbgChart.lowRejectCode > 0
+                        label.new(dbgChart.lowRejectTime, dbgChart.lowRejectPrice, "L x " + (dbgChart.lowRejectCode == 1 ? "not swing extreme" : "mid-range"),
+                             xloc=xloc.bar_time, style=label.style_label_up, size=size.tiny, color=color.new(color.gray, 20), textcolor=color.white)
+                    // The other market's swing is filtered too: show it on this chart's candle.
+                    if dbgOther.highRejectCode > 0
+                        label.new(dbgOther.highRejectTime, drawUsingNASPrices ? nasHigh : spxHigh, otherName + " H x " + (dbgOther.highRejectCode == 1 ? "not swing extreme" : "mid-range"),
+                             xloc=xloc.bar_time, yloc=yloc.abovebar, style=label.style_label_down, size=size.tiny, color=color.new(color.purple, 30), textcolor=color.white)
+                    if dbgOther.lowRejectCode > 0
+                        label.new(dbgOther.lowRejectTime, drawUsingNASPrices ? nasLow : spxLow, otherName + " L x " + (dbgOther.lowRejectCode == 1 ? "not swing extreme" : "mid-range"),
+                             xloc=xloc.bar_time, yloc=yloc.belowbar, style=label.style_label_up, size=size.tiny, color=color.new(color.purple, 30), textcolor=color.white)
                 // Independent alert-pivot engine. Pivot alerts are evaluated on
                 // this aligned, closed 5M NAS/SPX source pair only.
                 float nasAlertHighPivot = nasSource.alertPivotHigh
@@ -1116,6 +1151,9 @@ if canRunEngine
                              " | SPX " + f_debugTime(highSPXTime) + " @ " + str.tostring(highSPXPrice, format.mintick)
                         bool highRegistered = f_registerReference(activeHighReferences, nasSourceCandles, spxSourceCandles, true,
                              highNASTime, highNASPrice, highSPXTime, highSPXPrice, nasClose, REFERENCE_CAPACITY)
+                        if debugMode and drawingsVisible and highRegistered
+                            label.new(drawUsingNASPrices ? highNASTime : highSPXTime, drawUsingNASPrices ? highNASPrice : highSPXPrice, "ref",
+                                 xloc=xloc.bar_time, style=label.style_label_down, size=size.tiny, color=color.new(color.orange, 20), textcolor=color.white)
                         debugSignalStatus := highRegistered ? "High pair registered as active sweep reference" :
                              "High pair already taken by both markets; not registered"
                     else if not na(highComparedNASTime) and not na(highComparedSPXTime)
@@ -1139,6 +1177,9 @@ if canRunEngine
                             bool bearHidden = trendMode == "Hide counter-trend" and bearCounter
                             if bearHidden
                                 debugSignalStatus := debugSignalStatus + " (hidden: counter-trend)"
+                                if debugMode and drawingsVisible
+                                    label.new(nasTime, drawUsingNASPrices ? nasHigh : spxHigh, "bear SMT hidden: trend " + nasTrendState,
+                                         xloc=xloc.bar_time, style=label.style_label_down, size=size.small, color=color.new(color.gray, 20), textcolor=color.white)
                             // The drawing and the alert share this one validated event.
                             if not bearHidden and enableAlerts and enableBearishAlerts and not array.includes(alertProcessedKeys, eventKey)
                                 array.push(alertProcessedKeys, eventKey)
@@ -1153,6 +1194,9 @@ if canRunEngine
                                 f_recordDraw(historicalDraws, pendingDraws, drawing, maximumHistoricalSignals, showOnlyLatest, barstate.ishistory)
                     else if bearDivergedCount > 0
                         debugSignalStatus := "Bearish sweep not confirmed: " + bearReason
+                        if debugMode and drawingsVisible
+                            label.new(nasTime, drawUsingNASPrices ? nasHigh : spxHigh, "bear SMT x " + bearReason,
+                                 xloc=xloc.bar_time, style=label.style_label_down, size=size.small, color=color.new(color.red, 40), textcolor=color.white)
                 // Bullish SMT uses the same reference/sweep logic on confirmed lows.
                 if needBullishEngine
                     [lowMatched, lowNASTime, lowNASPrice, lowSPXTime, lowSPXPrice, lowComparedNASTime, lowComparedSPXTime] =
@@ -1166,6 +1210,9 @@ if canRunEngine
                              " | SPX " + f_debugTime(lowSPXTime) + " @ " + str.tostring(lowSPXPrice, format.mintick)
                         bool lowRegistered = f_registerReference(activeLowReferences, nasSourceCandles, spxSourceCandles, false,
                              lowNASTime, lowNASPrice, lowSPXTime, lowSPXPrice, nasClose, REFERENCE_CAPACITY)
+                        if debugMode and drawingsVisible and lowRegistered
+                            label.new(drawUsingNASPrices ? lowNASTime : lowSPXTime, drawUsingNASPrices ? lowNASPrice : lowSPXPrice, "ref",
+                                 xloc=xloc.bar_time, style=label.style_label_up, size=size.tiny, color=color.new(color.orange, 20), textcolor=color.white)
                         debugSignalStatus := lowRegistered ? "Low pair registered as active sweep reference" :
                              "Low pair already taken by both markets; not registered"
                     else if not na(lowComparedNASTime) and not na(lowComparedSPXTime)
@@ -1189,6 +1236,9 @@ if canRunEngine
                             bool bullHidden = trendMode == "Hide counter-trend" and bullCounter
                             if bullHidden
                                 debugSignalStatus := debugSignalStatus + " (hidden: counter-trend)"
+                                if debugMode and drawingsVisible
+                                    label.new(nasTime, drawUsingNASPrices ? nasLow : spxLow, "bull SMT hidden: trend " + nasTrendState,
+                                         xloc=xloc.bar_time, style=label.style_label_up, size=size.small, color=color.new(color.gray, 20), textcolor=color.white)
                             // The drawing and the alert share this one validated event.
                             if not bullHidden and enableAlerts and enableBullishAlerts and not array.includes(alertProcessedKeys, eventKey)
                                 array.push(alertProcessedKeys, eventKey)
@@ -1203,6 +1253,9 @@ if canRunEngine
                                 f_recordDraw(historicalDraws, pendingDraws, drawing, maximumHistoricalSignals, showOnlyLatest, barstate.ishistory)
                     else if bullDivergedCount > 0
                         debugSignalStatus := "Bullish sweep not confirmed: " + bullReason
+                        if debugMode and drawingsVisible
+                            label.new(nasTime, drawUsingNASPrices ? nasLow : spxLow, "bull SMT x " + bullReason,
+                                 xloc=xloc.bar_time, style=label.style_label_up, size=size.small, color=color.new(color.green, 40), textcolor=color.white)
                 // Pending alerts advance only on closed 5M source candles, so the
                 // delay counts real 5M candle closes.
                 f_processPendingAlerts(pendingAlerts, alertedKeys, nasClose,
